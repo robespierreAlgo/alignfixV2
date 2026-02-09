@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AlignFix</title>
+  <link rel="stylesheet" href="ui/styles/main.css" />
+
+  <link rel="icon" type="image/x-icon" href="ui/img/favicon.ico" />
+
+  <!-- bootstrap -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"
+    integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+    integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
+    crossorigin="anonymous"></script>
+
+  <!-- FontAwesome -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+
+  <!-- DataTables Scroller -->
+  <link rel="stylesheet" href="https://cdn.datatables.net/scroller/2.4.3/css/scroller.dataTables.min.css">
+
+</head>
+<body>
+  <div class="d-flex">
+    <nav class="sidebar d-flex flex-column flex-shrink-0 position-fixed">
+
+        <div class="pt-3 pb-2 px-4 top">
+          <a class="navbar-brand d-flex align-items-center" href="#home">
+            <h2 class="fw-bold mb-2">
+              <i class="fas fa-align-center alignfix-icon me-3"></i>
+              AlignFix
+            </h2>
+          </a>
+        </div>
+
+        <div id="sidebar-content" class="p-4"></div>
+    </nav>
+
+    <main class="main-content">
+      <nav class="navbar navbar-expand-lg navbar-light py-2 border-bottom">
+        <ul class="navbar-nav">
+            <li id="project" class="nav-item" style="display: none;">
+                <a class="nav-link" href="#project">Home</a>
+            </li>
+            <li id="stats" class="nav-item" style="display: none;">
+                <a class="nav-link" href="#stats">Stats</a>
+            </li>
+            <li id="history" class="nav-item" style="display: none;">
+                <a class="nav-link" href="#history">History</a>
+            </li>
+            <li id="scores" class="nav-item" style="display: none;">
+                <a class="nav-link" href="#scores">Scores</a>
+            </li>
+        </ul>
+        <ul class="navbar-nav ms-auto">
+            <li id="home" class="nav-item">
+                <a class="nav-link" href="#home">Start</a>
+            </li>
+            <li id="about" class="nav-item">
+                <a class="nav-link" href="#about">About</a>
+            </li>
+        </ul>
+      </nav>
+      <div class="progress-container border-bottom" id="progressbar-container">
+        <div class="progress-header d-flex align-items-center justify-content-between px-3 py-2" 
+             style="cursor: pointer; background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); min-height: 48px;">
+          <div class="d-flex align-items-center">
+            <i id="progressbar-arrow" class="fas fa-chevron-down me-2 text-muted"></i>
+            <span id="progressbar-label" class="fw-medium text-dark">Show logs</span>
+            <span id="progressbar-status" class="badge bg-secondary ms-2 d-none">Ready</span>
+          </div>
+          <div class="d-flex align-items-center gap-2">
+            <div id="progressbar-info" class="small text-muted d-none">
+              <span id="current-operation">Initializing...</span>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <div class="progress" style="width: 100px; height: 6px;">
+                <div id="progressbar" class="progress-bar" 
+                     role="progressbar" style="width: 0%" 
+                     aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+              </div>
+              <span id="progressbar-percentage" class="small fw-bold text-dark" style="min-width: 30px;">0%</span>
+            </div>
+          </div>
+        </div>
+        <div id="log" class="collapse">
+          <div class="p-3" style="background: #f8f9fa; border-top: 1px solid #dee2e6; max-height: 250px; overflow-y: auto;">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <small class="text-muted">
+                <i class="fas fa-terminal me-1"></i>Process Logs
+              </small>
+              <button id="clear-logs-btn" class="btn btn-sm btn-outline-secondary" title="Clear logs">
+                <i class="fas fa-trash-alt"></i>
+              </button>
+            </div>
+            <div id="log-messages" class="font-monospace small"></div>
+          </div>
+        </div>
+      </div>
+      <div class="mt-4 mb-4">
+        <div class="loader"></div>
+        <div id="app"></div>
+        <div id="stats"></div>
+      </div>
+
+
+    </main>
+
+  </div>
+    <script>
+(function () {
+    var old = console.log;
+    var oldError = console.error;
+    var logger = document.getElementById('log-messages');
+    var logContainer = document.getElementById('log');
+    var progressbar = document.getElementById('progressbar');
+    var arrow = document.getElementById('progressbar-arrow');
+    var label = document.getElementById('progressbar-label');
+    var percentage = document.getElementById('progressbar-percentage');
+    var status = document.getElementById('progressbar-status');
+    var currentOp = document.getElementById('current-operation');
+    var progressInfo = document.getElementById('progressbar-info');
+    
+    function updateLabel() {
+        const isOpen = logContainer.classList.contains('show');
+        if (isOpen) {
+            arrow.className = 'fas fa-chevron-up me-2 text-muted';
+            label.textContent = 'Hide logs';
+        } else {
+            arrow.className = 'fas fa-chevron-down me-2 text-muted';
+            label.textContent = 'Show logs';
+        }
+    }
+
+    function updateProgress(value, operation = null) {
+        const clampedValue = Math.max(0, Math.min(100, value));
+        progressbar.style.width = clampedValue + '%';
+        progressbar.setAttribute('aria-valuenow', clampedValue);
+        percentage.textContent = clampedValue + '%';
+        
+        // Update colors
+        progressbar.className = 'progress-bar';
+        status.classList.remove('d-none');
+        
+        if (clampedValue === 100) {
+            progressbar.classList.add('bg-success');
+            status.textContent = 'Complete';
+            status.className = 'badge bg-success ms-2';
+        } else if (clampedValue > 0) {
+            progressbar.classList.add('bg-primary');
+            status.textContent = 'Processing';
+            status.className = 'badge bg-primary ms-2';
+        } else {
+            progressbar.classList.add('bg-secondary');
+            status.textContent = 'Ready';
+            status.className = 'badge bg-secondary ms-2';
+        }
+        
+        if (operation) {
+            currentOp.textContent = operation;
+            progressInfo.classList.remove('d-none');
+        }
+    }
+
+    function addLogMessage(text, isError = false) {
+        const timestamp = new Date().toLocaleTimeString();
+        const messageDiv = document.createElement('div');
+        messageDiv.className = isError ? 'text-danger mb-1' : 'text-dark mb-1';
+        messageDiv.innerHTML = `<span class="text-muted">[${timestamp}]</span> ${text}`;
+        
+        if (text) {
+          logger.appendChild(messageDiv);
+        }
+
+        // Scroll to bottom - get the parent container that has the scroll
+        const logContainer = logger.parentElement;
+        if (logContainer) {
+            // Use setTimeout to ensure the DOM has updated before scrolling
+            setTimeout(() => {
+                logContainer.scrollTop = logContainer.scrollHeight;
+            }, 50);
+        }
+        
+        // Fallback: also try scrolling the logger itself
+        setTimeout(() => {
+            logger.scrollTop = logger.scrollHeight;
+        }, 50);
+    }
+
+    function toggleLogs() {
+        
+        if (logContainer.classList.contains('show')) {
+            logContainer.classList.remove('show');
+        } else {
+            logContainer.classList.add('show');
+        }
+
+        if (logContainer.classList.contains('show')) {
+            console.log('');
+        }
+        updateLabel();
+    }
+
+    // Console overrides
+    console.log = function (...args) {
+        const text = args.join(' ');
+        
+        // Handle progress updates
+        const progressMatch = text.match(/^progress:(\d{1,3})$/);
+        if (progressMatch) {
+            updateProgress(parseInt(progressMatch[1]));
+            return;
+        }
+        
+        // Handle operation updates
+        const operationMatch = text.match(/^operation:(.+)$/);
+        if (operationMatch) {
+            updateProgress(parseInt(progressbar.getAttribute('aria-valuenow')), operationMatch[1]);
+            return;
+        }
+        
+        // Skip our debug messages from being added to logs
+        if (!text.includes('Toggle logs') && !text.includes('Hiding logs') && !text.includes('Showing logs')) {
+            addLogMessage(text);
+        }
+        old.apply(console, args);
+    };
+
+    console.error = function (...args) {
+        const text = args.join(' ');
+        addLogMessage(text, true);
+        oldError.apply(console, args);
+    };
+
+    // Wait for DOM to be ready
+    function initializeEventListeners() {
+        const progressHeader = document.querySelector('.progress-header');
+        const clearBtn = document.getElementById('clear-logs-btn');
+        
+        if (progressHeader) {
+            progressHeader.addEventListener('click', function(e) {
+                toggleLogs();
+            });
+        }
+        
+        if (clearBtn) {
+            clearBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                logger.innerHTML = '';
+                addLogMessage('Logs cleared');
+            });
+        } else {
+            console.error('Clear button not found');
+        }
+    }
+
+    // Initialize when DOM is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initializeEventListeners);
+    } else {
+        initializeEventListeners();
+    }
+
+    // Initialize
+    updateLabel();
+    updateProgress(0);
+})();
+</script>
+  <!-- Load Pyodide -->
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.29.0/full/pyodide.js"></script>
+
+
+  <!-- DataTables dependencies -->
+  <link rel="stylesheet" href="https://cdn.datatables.net/2.0.5/css/dataTables.dataTables.min.css">
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.datatables.net/2.0.5/js/dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/scroller/2.4.3/js/dataTables.scroller.min.js"></script>
+  <script src="https://cdn.datatables.net/scroller/2.4.3/js/scroller.dataTables.js"></script>
+
+
+  <!-- Fast Align -->
+  <script type="module" src="./main.js"></script>
+
+  <!-- Dynamic WASM Module Loader - detects hardware and loads appropriate versions -->
+  <script src="backend/module-loader.js"></script>
+
+  <!-- 
+    WASM modules are now loaded dynamically based on hardware:
+    - Detects available CPU cores and memory
+    - Loads appropriate version: _p1 (1 core), _p4 (4 cores), _p8 (8 cores), or _p16 (16 cores)
+    - Use window.WasmModuleLoader to load modules programmatically
+  -->
+
+  <!-- for histogram -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script> 
+
+  <!-- to create zip -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script>
+        function toggleSidebar() {
+            const sidebar = document.querySelector('.sidebar');
+            sidebar.classList.toggle('collapsed');
+        }
+    </script>
+  </body>
+</html>
