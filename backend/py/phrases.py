@@ -460,54 +460,156 @@ def get_phrase_occurrences(project_id, phrase1_tok_str, phrase2_tok_str, directi
 
     return [row[0] for row in rows], total_count
 
-def fetch_phrases(project_id, start, length, search_value, direction=0, min_length=1):
 
+# def fetch_phrases(project_id, start, length, search_value, direction=0, min_length=1):
+
+#     _, cursor = get_db()
+
+#     ignore = 0  # only fetch non-ignored phrases
+#     # 1) Count total rows for this project (before LIMIT/OFFSET)
+#     cursor.execute("SELECT COUNT(*) FROM phrases WHERE project_id=? AND ignore=? AND direction=? AND (LENGTH(src_phrase) - LENGTH(REPLACE(src_phrase, ' ', '')) = ? OR LENGTH(tgt_phrase) - LENGTH(REPLACE(tgt_phrase, ' ', '')) = ?)", (project_id, ignore, direction, min_length - 1, min_length - 1))
+#     total_records = cursor.fetchone()[0]
+
+#     # 2) Apply optional filtering
+#     if search_value:
+
+#         search_value_tok_str = tokenise(search_value, as_string=True)
+#         like = f"%{search_value_tok_str}%"
+
+#         print(f"Filtering phrases with search term: {search_value_tok_str}")
+
+#         cursor.execute("""SELECT COUNT(*) 
+#                      FROM phrases
+#                      WHERE project_id=? 
+#                      AND ignore=?
+#                      AND (src_phrase LIKE ? OR tgt_phrase LIKE ?)""",
+#                   (project_id, ignore, like, like))
+#         filtered_records = cursor.fetchone()[0]
+
+#         query = """SELECT id, src_phrase, tgt_phrase, direction, num_occurrences
+#                    FROM phrases
+#                    WHERE project_id=? 
+#                    AND ignore=?
+#                    AND (src_phrase LIKE ? OR tgt_phrase LIKE ?)
+#                    ORDER BY num_occurrences DESC 
+#                    LIMIT ? OFFSET ?"""
+#         cursor.execute(query, (project_id, ignore, like, like, length, start))
+#     else:
+#         # no filtering
+#         filtered_records = total_records
+#         query = """SELECT id, src_phrase, tgt_phrase, direction, num_occurrences
+#                    FROM phrases
+#                    WHERE project_id=?
+#                    AND ignore=?
+#                    AND direction=?
+#                    ORDER BY num_occurrences DESC 
+#                    LIMIT ? OFFSET ?"""
+#         cursor.execute(query, (project_id, ignore, direction, length, start))
+#         # cursor.execute(query, (project_id, ignore, direction, min_length - 1, min_length - 1, length, start))
+
+#                 #    AND (LENGTH(src_phrase) - LENGTH(REPLACE(src_phrase, ' ', '')) = ?
+#                 #    OR LENGTH(tgt_phrase) - LENGTH(REPLACE(tgt_phrase, ' ', '')) = ?)
+#     phrases = cursor.fetchall()
+
+#     phrase_ids = [row[0] for row in phrases]
+#     src_phrases = [detokenise(row[1]) for row in phrases]
+#     tgt_phrases = [detokenise(row[2]) for row in phrases]
+#     directions = [row[3] for row in phrases]
+#     num_occurrences = [row[4] for row in phrases]
+
+#     return phrase_ids, src_phrases, tgt_phrases, directions, num_occurrences, total_records, filtered_records
+
+# UPDATE 11.02.26
+def fetch_phrases(project_id, start, length, search_value, direction=0, min_length=1):
     _, cursor = get_db()
 
     ignore = 0  # only fetch non-ignored phrases
-    # 1) Count total rows for this project (before LIMIT/OFFSET)
-    cursor.execute("SELECT COUNT(*) FROM phrases WHERE project_id=? AND ignore=? AND direction=? AND (LENGTH(src_phrase) - LENGTH(REPLACE(src_phrase, ' ', '')) = ? OR LENGTH(tgt_phrase) - LENGTH(REPLACE(tgt_phrase, ' ', '')) = ?)", (project_id, ignore, direction, min_length - 1, min_length - 1))
+
+    # Filter out anything that is in ignored table.
+    # If ignored.tgt_phrase == '' => wildcard (ignore by src only).
+    ignored_filter = """
+      AND NOT EXISTS (
+        SELECT 1 FROM ignored i
+        WHERE i.project_id = p.project_id
+          AND i.src_phrase COLLATE NOCASE = p.src_phrase COLLATE NOCASE
+          AND (i.tgt_phrase = '' OR i.tgt_phrase COLLATE NOCASE = p.tgt_phrase COLLATE NOCASE)
+      )
+    """
+
+    len_filter = """
+      AND (
+        (LENGTH(p.src_phrase) - LENGTH(REPLACE(p.src_phrase, ' ', '')) = ?)
+        OR
+        (LENGTH(p.tgt_phrase) - LENGTH(REPLACE(p.tgt_phrase, ' ', '')) = ?)
+      )
+    """
+
+    # 1) Count total rows (before paging)
+    cursor.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM phrases p
+        WHERE p.project_id=?
+          AND p.ignore=?
+          AND p.direction=?
+          {ignored_filter}
+          {len_filter}
+        """,
+        (project_id, ignore, direction, min_length - 1, min_length - 1)
+    )
     total_records = cursor.fetchone()[0]
 
-    # 2) Apply optional filtering
+    # 2) Filtering by search term
     if search_value:
-
         search_value_tok_str = tokenise(search_value, as_string=True)
         like = f"%{search_value_tok_str}%"
-
         print(f"Filtering phrases with search term: {search_value_tok_str}")
 
-        cursor.execute("""SELECT COUNT(*) 
-                     FROM phrases
-                     WHERE project_id=? 
-                     AND ignore=?
-                     AND (src_phrase LIKE ? OR tgt_phrase LIKE ?)""",
-                  (project_id, ignore, like, like))
+        cursor.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM phrases p
+            WHERE p.project_id=?
+              AND p.ignore=?
+              AND p.direction=?
+              {ignored_filter}
+              AND (p.src_phrase LIKE ? OR p.tgt_phrase LIKE ?)
+            """,
+            (project_id, ignore, direction, like, like)
+        )
         filtered_records = cursor.fetchone()[0]
 
-        query = """SELECT id, src_phrase, tgt_phrase, direction, num_occurrences
-                   FROM phrases
-                   WHERE project_id=? 
-                   AND ignore=?
-                   AND (src_phrase LIKE ? OR tgt_phrase LIKE ?)
-                   ORDER BY num_occurrences DESC 
-                   LIMIT ? OFFSET ?"""
-        cursor.execute(query, (project_id, ignore, like, like, length, start))
+        cursor.execute(
+            f"""
+            SELECT p.id, p.src_phrase, p.tgt_phrase, p.direction, p.num_occurrences
+            FROM phrases p
+            WHERE p.project_id=?
+              AND p.ignore=?
+              AND p.direction=?
+              {ignored_filter}
+              AND (p.src_phrase LIKE ? OR p.tgt_phrase LIKE ?)
+            ORDER BY p.num_occurrences DESC
+            LIMIT ? OFFSET ?
+            """,
+            (project_id, ignore, direction, like, like, length, start)
+        )
     else:
-        # no filtering
         filtered_records = total_records
-        query = """SELECT id, src_phrase, tgt_phrase, direction, num_occurrences
-                   FROM phrases
-                   WHERE project_id=?
-                   AND ignore=?
-                   AND direction=?
-                   ORDER BY num_occurrences DESC 
-                   LIMIT ? OFFSET ?"""
-        cursor.execute(query, (project_id, ignore, direction, length, start))
-        # cursor.execute(query, (project_id, ignore, direction, min_length - 1, min_length - 1, length, start))
+        cursor.execute(
+            f"""
+            SELECT p.id, p.src_phrase, p.tgt_phrase, p.direction, p.num_occurrences
+            FROM phrases p
+            WHERE p.project_id=?
+              AND p.ignore=?
+              AND p.direction=?
+              {ignored_filter}
+              {len_filter}
+            ORDER BY p.num_occurrences DESC
+            LIMIT ? OFFSET ?
+            """,
+            (project_id, ignore, direction, min_length - 1, min_length - 1, length, start)
+        )
 
-                #    AND (LENGTH(src_phrase) - LENGTH(REPLACE(src_phrase, ' ', '')) = ?
-                #    OR LENGTH(tgt_phrase) - LENGTH(REPLACE(tgt_phrase, ' ', '')) = ?)
     phrases = cursor.fetchall()
 
     phrase_ids = [row[0] for row in phrases]
@@ -518,47 +620,86 @@ def fetch_phrases(project_id, start, length, search_value, direction=0, min_leng
 
     return phrase_ids, src_phrases, tgt_phrases, directions, num_occurrences, total_records, filtered_records
 
+# def fetch_ignored_phrases(project_id, start, length):
+#     _, cursor = get_db()
+
+#     # Collect all ignored phrases from both sources
+#     all_phrases = []
+
+#     # 1) Get phrases from phrases table where ignore=1
+#     cursor.execute("""SELECT id, src_phrase, tgt_phrase, 0 as imported
+#                       FROM phrases
+#                       WHERE project_id=? AND ignore=1
+#                       ORDER BY num_occurrences DESC""", (project_id,))
+#     phrases_ignored = cursor.fetchall()
+#     all_phrases.extend(phrases_ignored)
+
+#     # 2) Get additional phrases from ignored table
+#     additional_phrases = get_phrases_to_ignore(project_id)
+#     for (id, src, tgt) in additional_phrases:
+#         all_phrases.append((id, src, tgt, 1))  # 1 = imported
+    
+#     # 3) Calculate total count
+#     total_records = len(all_phrases)
+
+#     # 4) Apply pagination
+#     paginated_phrases = all_phrases[start:start + length]
+
+#     # 5) Build result arrays
+#     phrase_ids = []
+#     src_phrases = []
+#     tgt_phrases = []
+#     imported = []
+
+#     for row in paginated_phrases:
+#         phrase_ids.append(row[0])
+#         src_phrases.append(detokenise(row[1]))
+#         tgt_phrases.append(detokenise(row[2]))
+#         imported.append(row[3])
+
+#     return phrase_ids, src_phrases, tgt_phrases, imported, total_records
+
 def fetch_ignored_phrases(project_id, start, length):
     _, cursor = get_db()
 
-    # Collect all ignored phrases from both sources
-    all_phrases = []
+    # total count = ignored in phrases + imported ignored table
+    cursor.execute("""
+        SELECT
+          (SELECT COUNT(*) FROM phrases WHERE project_id=? AND ignore=1) +
+          (SELECT COUNT(*) FROM ignored WHERE project_id=?)
+    """, (project_id, project_id))
+    total_records = cursor.fetchone()[0]
 
-    # 1) Get phrases from phrases table where ignore=1
-    cursor.execute("""SELECT id, src_phrase, tgt_phrase, 0 as imported
-                      FROM phrases
-                      WHERE project_id=? AND ignore=1
-                      ORDER BY num_occurrences DESC""", (project_id,))
-    phrases_ignored = cursor.fetchall()
-    all_phrases.extend(phrases_ignored)
+    # paginate in SQL (no huge Python lists)
+    cursor.execute("""
+        SELECT id, src_phrase, tgt_phrase, imported
+        FROM (
+          SELECT id, src_phrase, tgt_phrase, 0 AS imported, num_occurrences AS score
+          FROM phrases
+          WHERE project_id=? AND ignore=1
 
-    # 2) Get additional phrases from ignored table
-    additional_phrases = get_phrases_to_ignore(project_id)
-    for (id, src, tgt) in additional_phrases:
-        all_phrases.append((id, src, tgt, 1))  # 1 = imported
-    
-    # 3) Calculate total count
-    total_records = len(all_phrases)
+          UNION ALL
 
-    # 4) Apply pagination
-    paginated_phrases = all_phrases[start:start + length]
+          SELECT id, src_phrase, tgt_phrase, 1 AS imported, NULL AS score
+          FROM ignored
+          WHERE project_id=?
+        )
+        ORDER BY (score IS NULL) ASC, score DESC
+        LIMIT ? OFFSET ?
+    """, (project_id, project_id, length, start))
 
-    # 5) Build result arrays
-    phrase_ids = []
-    src_phrases = []
-    tgt_phrases = []
-    imported = []
+    rows = cursor.fetchall()
 
-    for row in paginated_phrases:
-        phrase_ids.append(row[0])
-        src_phrases.append(detokenise(row[1]))
-        tgt_phrases.append(detokenise(row[2]))
-        imported.append(row[3])
+    phrase_ids, src_phrases, tgt_phrases, imported = [], [], [], []
+    for pid, src, tgt, imp in rows:
+        phrase_ids.append(pid)
+        src_phrases.append(detokenise(src))
+        tgt_phrases.append(detokenise(tgt))
+        imported.append(imp)
 
     return phrase_ids, src_phrases, tgt_phrases, imported, total_records
 
-
-def import_ignored_from_file(project_id, file_content):
+""" def import_ignored_from_file(project_id, file_content):
     
     try:
         ignored_phrases = json.loads(file_content)
@@ -580,6 +721,232 @@ def import_ignored_from_file(project_id, file_content):
     except json.JSONDecodeError as e:
         print(f"JSON decode error: {e}")
         return 0
+ """
+
+# UPDATE 08.02.26
+def import_ignored_from_file(project_id, file_content):
+    try:
+        ignored_phrases = json.loads(file_content)
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error: {e}")
+        return 0
+
+    if not isinstance(ignored_phrases, list):
+        print("Invalid format: JSON is not a list")
+        return 0
+
+    phrases = []
+    skipped = 0
+
+    for entry in ignored_phrases:
+        # accept either {"src": "...", "tgt": "..."} or {"src": "..."} (tgt optional)
+        if not isinstance(entry, dict):
+            skipped += 1
+            continue
+
+        src_raw = entry.get("src", "")
+        tgt_raw = entry.get("tgt", "")  # may be missing/empty
+
+        # tokenise() returns "" for empty input; that's fine for tgt
+        src_phrase = " ".join(strip_nb_bl((src_raw or "").strip().split()))
+        tgt_phrase = " ".join(strip_nb_bl((tgt_raw or "").strip().split()))
+
+        # IMPORTANT: require src to be non-empty, but allow empty tgt
+        if not src_phrase:
+            skipped += 1
+            continue
+
+        phrases.append({"src_phrase": src_phrase, "tgt_phrase": tgt_phrase})
+
+    if not phrases:
+        print("No valid ignored phrases found to import")
+        return 0
+
+    add_phrases_to_ignore(project_id, phrases)
+
+    # actually hide phrases (and apply combination rule)
+    apply_imported_ignored_to_phrases(project_id)
+    print(f"Imported {len(phrases)} ignored phrases for project {project_id} (skipped {skipped})")
+
+    return len(phrases)
+
+# UPDATE 08.02.26
+# import unicodedata
+# import re
+# import string
+
+# # include extra punctuation that string.punctuation doesn't cover well
+# _EXTRA_PUNCT = "«»“”„’‘–—…"
+# _PUNCT = string.punctuation + _EXTRA_PUNCT
+
+# def _norm_space(s: str) -> str:
+#     s = unicodedata.normalize("NFC", s or "")
+#     s = s.strip()
+#     s = re.sub(r"\s+", " ", s)
+#     return s
+
+# def _norm_token(tok: str) -> str:
+#     tok = _norm_space(tok).casefold()
+#     return tok.strip(_PUNCT)
+
+# def _norm_phrase(phrase: str) -> str:
+#     toks = [_norm_token(t) for t in _norm_space(phrase).split()]
+#     toks = [t for t in toks if t]
+#     return " ".join(toks)
+
+# def apply_imported_ignored_to_phrases(project_id):
+#     conn, cursor = get_db()
+
+#     # load ignored entries (tokenised)
+#     cursor.execute(
+#         "SELECT src_phrase, tgt_phrase FROM ignored WHERE project_id=?",
+#         (project_id,)
+#     )
+#     ignored_rows = cursor.fetchall()
+
+#     # Build ignore sets in NORMALISED (UI-like) form
+#     ignored_src_any = set()   # src-only (tgt empty) => wildcard
+#     ignored_pairs = set()     # exact src+tgt
+
+#     for src_tok, tgt_tok in ignored_rows:
+#         src_det = detokenise(src_tok or "")
+#         tgt_det = detokenise(tgt_tok or "")
+
+#         src_n = _norm_phrase(src_det)
+#         tgt_n = _norm_phrase(tgt_det)
+
+#         if not src_n:
+#             continue
+
+#         if tgt_n:
+#             ignored_pairs.add((src_n, tgt_n))
+#         else:
+#             ignored_src_any.add(src_n)
+
+#     # Apply ignores by scanning phrases and normalising them the same way
+#     cursor.execute(
+#         "SELECT id, src_phrase, tgt_phrase FROM phrases WHERE project_id=? AND ignore=0",
+#         (project_id,)
+#     )
+#     phrase_rows = cursor.fetchall()
+
+#     to_ignore = []
+#     for pid, src_tok, tgt_tok in phrase_rows:
+#         src_det = detokenise(src_tok or "")
+#         tgt_det = detokenise(tgt_tok or "")
+
+#         src_n = _norm_phrase(src_det)
+#         tgt_n = _norm_phrase(tgt_det)
+
+#         if not src_n:
+#             continue
+
+#         if (src_n in ignored_src_any) or ((src_n, tgt_n) in ignored_pairs):
+#             to_ignore.append((pid, project_id))
+
+#     if to_ignore:
+#         cursor.executemany(
+#             "UPDATE phrases SET ignore=1 WHERE id=? AND project_id=?",
+#             to_ignore
+#         )
+
+#     # Combination rule (src side): hide multiword src if all tokens are hidden single words
+#     hidden_words = {w for w in ignored_src_any if " " not in w}
+
+#     if hidden_words:
+#         cursor.execute(
+#             "SELECT id, src_phrase FROM phrases WHERE project_id=? AND ignore=0",
+#             (project_id,)
+#         )
+#         for pid, src_tok in cursor.fetchall():
+#             src_det = detokenise(src_tok or "")
+#             toks = [_norm_token(t) for t in _norm_space(src_det).split()]
+#             toks = [t for t in toks if t]
+#             if len(toks) > 1 and all(t in hidden_words for t in toks):
+#                 cursor.execute(
+#                     "UPDATE phrases SET ignore=1 WHERE id=? AND project_id=?",
+#                     (pid, project_id)
+#                 )
+#     cursor.execute("SELECT COUNT(*) FROM phrases WHERE project_id=? AND ignore=1", (project_id,))
+#     print("DEBUG phrases.ignore=1:", cursor.fetchone()[0])
+
+#     cursor.execute("SELECT src_phrase, tgt_phrase FROM ignored WHERE project_id=? LIMIT 3", (project_id,))
+#     print("DEBUG ignored sample:", cursor.fetchall())
+#     conn.commit()
+
+def apply_imported_ignored_to_phrases(project_id):
+    conn, cursor = get_db()
+
+    # --- load imported ignored entries ---
+    cursor.execute(
+        "SELECT src_phrase, tgt_phrase FROM ignored WHERE project_id=?",
+        (project_id,)
+    )
+    ignored_rows = cursor.fetchall()
+
+    # Compare in the SAME form as the UI shows (detokenised),
+    # and case-insensitive (so "ch" hides "Ch").
+    ignored_src_any = set()   # src-only ignores (tgt empty) => wildcard on tgt
+    ignored_pairs = set()     # exact src+tgt ignores
+
+    for src_tok, tgt_tok in ignored_rows:
+        src_det = detokenise(src_tok or "").strip()
+        tgt_det = detokenise(tgt_tok or "").strip()
+
+        if not src_det:
+            continue
+
+        if tgt_det:
+            ignored_pairs.add((src_det.casefold(), tgt_det.casefold()))
+        else:
+            ignored_src_any.add(src_det.casefold())
+
+    # --- 1) Apply direct ignores (single words + exact phrases) ---
+    cursor.execute(
+        "SELECT id, src_phrase, tgt_phrase FROM phrases WHERE project_id=? AND ignore=0",
+        (project_id,)
+    )
+    phrase_rows = cursor.fetchall()
+
+    to_ignore = []
+    for pid, src_tok, tgt_tok in phrase_rows:
+        src_det = detokenise(src_tok or "").strip()
+        tgt_det = detokenise(tgt_tok or "").strip()
+
+        if not src_det:
+            continue
+
+        s = src_det.casefold()
+        t = tgt_det.casefold()
+
+        if (s in ignored_src_any) or ((s, t) in ignored_pairs):
+            to_ignore.append((pid, project_id))
+
+    if to_ignore:
+        cursor.executemany(
+            "UPDATE phrases SET ignore=1 WHERE id=? AND project_id=?",
+            to_ignore
+        )
+
+    # --- 2) Combination rule (src side): hide "es as" if "es" and "as" are hidden ---
+    hidden_words = {w for w in ignored_src_any if " " not in w}
+
+    if hidden_words:
+        cursor.execute(
+            "SELECT id, src_phrase FROM phrases WHERE project_id=? AND ignore=0",
+            (project_id,)
+        )
+        for pid, src_tok in cursor.fetchall():
+            src_det = detokenise(src_tok or "").strip()
+            toks = [x.casefold() for x in src_det.split() if x.strip()]
+            if len(toks) > 1 and all(t in hidden_words for t in toks):
+                cursor.execute(
+                    "UPDATE phrases SET ignore=1 WHERE id=? AND project_id=?",
+                    (pid, project_id)
+                )
+
+    conn.commit()
+
 
 def get_all_phrases(project_id):
     """
