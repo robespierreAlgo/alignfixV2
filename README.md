@@ -11,6 +11,69 @@
 
 **AlignFix** is a browser-based tool for augmenting and refining parallel text corpora. Built entirely with WebAssembly (WASM), it provides desktop-class performance for word alignment, phrase extraction, and quality assessment—all running 100% locally in your browser with complete privacy.
 
+## Phrase Confidence Reports
+
+After phrase extraction, AlignFix analyzes how consistently each source
+phrase is translated.
+
+For every source phrase, we count:
+
+-   how often it appears in total
+-   how often each target translation appears
+
+From this we compute a simple confidence score:
+
+confidence = (most frequent translation count) / (total occurrences)
+
+The confidence value is between 0 and 1:
+
+-   1.0 → always translated the same way
+-   0.5 → two translations used equally often
+
+------------------------------------------------------------------------
+
+Sure Phrases
+
+A phrase is marked Sure if:
+
+-   it appears at least 10 times
+-   its confidence is ≥ 0.90
+
+This means that at least 90% of the time it is translated the same way.
+
+Interpretation: The translation is highly consistent in the corpus.
+
+------------------------------------------------------------------------
+
+Dubious Phrases
+
+A phrase is marked Dubious if:
+
+-   it appears at least 10 times
+-   it has at least 2 different target translations
+-   its confidence is ≤ 0.60
+
+This means the most common translation accounts for at most 60% of
+occurrences.
+
+Interpretation: The phrase is translated inconsistently and may need
+review.
+
+------------------------------------------------------------------------
+
+What the Exported Files Contain
+
+The CSV/JSON reports include:
+
+-   total — total number of occurrences
+-   top_tgt — most frequent translation
+-   top_count — number of times the most frequent translation occurs
+-   top_share — confidence score
+-   num_tgts — number of distinct translations
+-   entropy — how variable the translations are
+
+The top_share value is the confidence used for classification.
+
 ## 🌟 Key Features
 
 ### 🔗 Word Alignments

@@ -14,7 +14,23 @@
  * limitations under the License.
  */
 
-import { extractPhrases, fetchPhrases, fetchIgnoredPhrases, setIgnorePhrase, importIgnoredFromFile, downloadIgnoredPhrases, downloadPhrases, deleteAllIgnoredPhrases } from "../backend/js/phrases.js";
+import {
+  extractPhrases,
+  fetchPhrases,
+  fetchIgnoredPhrases,
+  setIgnorePhrase,
+  importIgnoredFromFile,
+  downloadIgnoredPhrases,
+  downloadPhrases,
+  deleteAllIgnoredPhrases,
+  downloadRobustnessReport,
+  downloadPhraseTranslationTableCSV,
+  downloadPhraseTranslationTableJSON,
+  downloadSurePhraseTableCSV,
+  downloadDubiousPhraseTableCSV,
+  downloadSurePhraseTableJSON,
+  downloadDubiousPhraseTableJSON
+} from "../backend/js/phrases.js";
 import { fetchTranslations, storeTranslation, deleteTranslation } from "../backend/js/alignments.js";
 import { applyFixes } from "../backend/js/fixes.js";
 import { getProject, saveProject, downloadProject, mergeProjectStats } from "../backend/js/projects.js";
@@ -88,6 +104,27 @@ export async function renderProject(id) {
       <div class="mt-2">
         <button id="download-phrases-btn" class="btn btn-sm btn-secondary">
           <i class="fas fa-download"></i> Download Phrases
+        </button>
+        <button id="download-robustness-btn" class="btn btn-outline-secondary btn-sm">
+          Download Robustness Report
+        </button>
+        <button id="download-phrase-table-csv-btn" class="btn btn-outline-secondary btn-sm">
+          Download Phrase Table (CSV)
+        </button>
+        <button id="download-phrase-table-json-btn" class="btn btn-outline-secondary btn-sm">
+          Download Phrase Table (JSON)
+        </button>
+        <button id="download-sure-phrases-btn" class="btn btn-outline-secondary btn-sm">
+          Download Sure Phrases (CSV)
+        </button>
+        <button id="download-dubious-phrases-btn" class="btn btn-outline-secondary btn-sm">
+          Download Dubious Phrases (CSV)
+        </button>
+        <button id="download-sure-phrases-json-btn" class="btn btn-outline-secondary btn-sm">
+          Download Sure Phrases (JSON)
+        </button>
+        <button id="download-dubious-phrases-json-btn" class="btn btn-outline-secondary btn-sm">
+          Download Dubious Phrases (JSON)
         </button>
       </div>
       <!-- Fixes Preview -->
@@ -290,7 +327,7 @@ export async function renderProject(id) {
           <button class="btn btn-primary" type="button" id="threshold-btn-soft">
             <i class="fas fa-refresh"></i> Extract phrases
           </button>
-          <button class="btn btn-warning type="button" id="threshold-btn-hard">
+          <button class="btn btn-warning" type="button" id="threshold-btn-hard">
             <i class="fas fa-arrows-left-right"></i> Realign sentences
           </button>
         </div>
@@ -330,6 +367,31 @@ export async function renderProject(id) {
   document.getElementById("fix-percentage").addEventListener("input", (event) => {
     document.getElementById("fix-percentage-value").textContent = `${event.target.value}%`;
   });
+
+  // NOTE: don't use bindAsyncButton here (it awaits nextFrame and can break downloads)
+  const rb = document.getElementById("download-robustness-btn");
+  if (rb) {
+    rb.addEventListener("click", () => downloadRobustnessReport(id));
+  }
+
+  // Downloads should be direct click handlers (no bindAsyncButton), so browsers allow them reliably.
+  const csvBtn = document.getElementById("download-phrase-table-csv-btn");
+  if (csvBtn) csvBtn.addEventListener("click", () => downloadPhraseTranslationTableCSV(id));
+
+  const jsonBtn = document.getElementById("download-phrase-table-json-btn");
+  if (jsonBtn) jsonBtn.addEventListener("click", () => downloadPhraseTranslationTableJSON(id));
+
+  const sureBtn = document.getElementById("download-sure-phrases-btn");
+  if (sureBtn) sureBtn.addEventListener("click", () => downloadSurePhraseTableCSV(id));
+
+  const dubBtn = document.getElementById("download-dubious-phrases-btn");
+  if (dubBtn) dubBtn.addEventListener("click", () => downloadDubiousPhraseTableCSV(id));
+
+  const sureJsonBtn = document.getElementById("download-sure-phrases-json-btn");
+  if (sureJsonBtn) sureJsonBtn.addEventListener("click", () => downloadSurePhraseTableJSON(id));
+
+  const dubJsonBtn = document.getElementById("download-dubious-phrases-json-btn");
+  if (dubJsonBtn) dubJsonBtn.addEventListener("click", () => downloadDubiousPhraseTableJSON(id));
 
   // Initialize Bootstrap tooltips
   const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));

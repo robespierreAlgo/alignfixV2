@@ -22,6 +22,525 @@ import { safeSyncfs } from "./storage.js";
 
 const SAVE_BATCH_SIZE = 100000; // adjust based on memory
 
+// =======================
+// Full Phrase Translation Table (CSV/JSON)
+// Keeps tokens exactly as-is; includes multi-word phrases.
+// =======================
+
+// In-memory cache so downloads can happen synchronously on button click (no awaits).
+// If user reloads the page, they need to re-run Extract phrases before downloading.
+const _LAST_EXTRACTED_PHRASES_BY_PROJECT = new Map();
+
+function cacheExtractedPhrases(projectId, phrasesArray) {
+  _LAST_EXTRACTED_PHRASES_BY_PROJECT.set(String(projectId), phrasesArray);
+}
+
+function getCachedExtractedPhrases(projectId) {
+  return _LAST_EXTRACTED_PHRASES_BY_PROJECT.get(String(projectId)) || null;
+}
+
+function _csvEscape(v) {
+  const s = String(v ?? "");
+  if (/[",\n\r]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+function _entropyFromCounts(counts) {
+  // counts: number[]
+  const total = counts.reduce((a, b) => a + b, 0);
+  if (!total) return 0;
+  let h = 0;
+  for (const c of counts) {
+    if (!c) continue;
+    const p = c / total;
+    h -= p * Math.log(p); // natural log
+  }
+  return h;
+}
+
+function buildPhraseTranslationTable(phrasesArray, opts = {}) {
+  const {
+    // include multi-word phrases by default (what you asked)
+    includeMultiWord = true,
+
+    // include single word phrases too
+    includeSingleWord = true,
+
+    // optional: filter on total counts per src phrase (after aggregating over tgts)
+    minTotal = 1,
+
+    // how many target alternatives to keep in topk
+    topK = 10,
+
+    // If true, compute separate rows per direction (recommended)
+    // Rows will have a "direction" field ("0", "-1", "1", etc.)
+    splitByDirection = true,
+  } = opts;
+
+  const isSingleWord = (s) => !/\s/.test((s || "").trim());
+
+  // Map key: (direction + "\u0000" + src) OR just src
+  // value: Map(tgt -> count)
+  const agg = new Map();
+
+  for (const p of phrasesArray || []) {
+    const src = (p.src_phrase || "").trim();
+    const tgt = (p.tgt_phrase || "").trim();
+    const c = Number(p.num_occurrences || 0);
+    const dir = String(p.direction ?? 0);
+
+    if (!src || !tgt || !Number.isFinite(c) || c <= 0) continue;
+
+    const single = isSingleWord(src);
+    if (single && !includeSingleWord) continue;
+    if (!single && !includeMultiWord) continue;
+
+    const key = splitByDirection ? `${dir}\u0000${src}` : src;
+
+    let tgtMap = agg.get(key);
+    if (!tgtMap) {
+      tgtMap = new Map();
+      agg.set(key, tgtMap);
+    }
+    tgtMap.set(tgt, (tgtMap.get(tgt) || 0) + c);
+  }
+
+  const rows = [];
+  const byDirCounts = {}; // direction -> row count
+
+  for (const [key, tgtMap] of agg.entries()) {
+    let dir = "all";
+    let src = key;
+
+    if (splitByDirection) {
+      const idx = key.indexOf("\u0000");
+      dir = key.slice(0, idx);
+      src = key.slice(idx + 1);
+    }
+
+    const entries = Array.from(tgtMap.entries()).sort((a, b) => b[1] - a[1]);
+    const total = entries.reduce((acc, [, c]) => acc + c, 0);
+    if (total < minTotal) continue;
+
+    const [topTgt, topCount] = entries[0];
+    const topShare = total ? topCount / total : 0;
+
+    const topk = entries.slice(0, topK).map(([tgt, count]) => ({
+      tgt,
+      count,
+      share: total ? count / total : 0,
+    }));
+
+    const entropy = _entropyFromCounts(entries.map(([, c]) => c));
+
+    const row = {
+      direction: dir,
+      src,
+      total,
+      top_tgt: topTgt,
+      top_count: topCount,
+      top_share: topShare,
+      num_tgts: entries.length,
+      entropy,
+      topk,
+    };
+
+    rows.push(row);
+    byDirCounts[dir] = (byDirCounts[dir] || 0) + 1;
+  }
+
+  // Sort: most frequent first
+  rows.sort((a, b) => b.total - a.total);
+
+  return {
+    params: { includeMultiWord, includeSingleWord, minTotal, topK, splitByDirection },
+    summary: {
+      num_rows: rows.length,
+      rows_by_direction: byDirCounts,
+    },
+    rows,
+  };
+}
+
+function phraseTranslationTableToCSV(table) {
+  const header = [
+    "direction",
+    "src",
+    "total",
+    "top_tgt",
+    "top_count",
+    "top_share",
+    "num_tgts",
+    "entropy",
+    "topk",
+  ].join(",");
+
+  const lines = [header];
+
+  for (const r of table.rows) {
+    const topkStr = (r.topk || [])
+      .map(x => `${x.tgt}(${x.count})`)
+      .join("|");
+
+    lines.push([
+      _csvEscape(r.direction),
+      _csvEscape(r.src),
+      _csvEscape(r.total),
+      _csvEscape(r.top_tgt),
+      _csvEscape(r.top_count),
+      _csvEscape(r.top_share.toFixed(6)),
+      _csvEscape(r.num_tgts),
+      _csvEscape(r.entropy.toFixed(6)),
+      _csvEscape(topkStr),
+    ].join(","));
+  }
+
+  return lines.join("\n");
+}
+
+// Exported downloaders (must be defined only once)
+export function downloadPhraseTranslationTableCSV(project_id) {
+  const phrases = getCachedExtractedPhrases(project_id);
+  if (!phrases) {
+    alert(`No extracted phrases cached for project ${project_id}.\nRun "Extract phrases" first (same session).`);
+    return;
+  }
+
+  const table = buildPhraseTranslationTable(phrases, {
+    includeSingleWord: true,
+    includeMultiWord: true,
+    minTotal: 1,
+    topK: 10,
+    splitByDirection: true,
+  });
+
+  const csv = phraseTranslationTableToCSV(table);
+  const ts = new Date().toISOString().replace(/[:]/g, "-");
+  downloadTextFile(`phrase_translation_table_project_${project_id}_${ts}.csv`, csv);
+}
+
+export function downloadPhraseTranslationTableJSON(project_id) {
+  const phrases = getCachedExtractedPhrases(project_id);
+  if (!phrases) {
+    alert(`No extracted phrases cached for project ${project_id}.\nRun "Extract phrases" first (same session).`);
+    return;
+  }
+
+  const table = buildPhraseTranslationTable(phrases, {
+    includeSingleWord: true,
+    includeMultiWord: true,
+    minTotal: 1,
+    topK: 10,
+    splitByDirection: true,
+  });
+
+  const jsonStr = JSON.stringify(table, null, 2);
+  const ts = new Date().toISOString().replace(/[:]/g, "-");
+  downloadTextFile(`phrase_translation_table_project_${project_id}_${ts}.json`, jsonStr);
+}
+
+// =======================
+// Filtered reports: DUBIOUS vs SURE
+// =======================
+
+function filterPhraseTranslationTable(table, predicate) {
+  const rows = (table.rows || []).filter(predicate);
+  const byDir = {};
+  for (const r of rows) byDir[r.direction] = (byDir[r.direction] || 0) + 1;
+
+  return {
+    ...table,
+    summary: {
+      ...table.summary,
+      num_rows: rows.length,
+      rows_by_direction: byDir,
+    },
+    rows,
+  };
+}
+
+// Tune these defaults as you like:
+const DEFAULT_FILTER_MIN_TOTAL = 10;     // lower than 30 because multi-word phrases are rarer
+const SURE_TOP_SHARE = 0.90;             // "sure" if top translation ≥ 90%
+const DUBIOUS_TOP_SHARE = 0.60;          // "dubious" if top translation ≤ 60%
+const DUBIOUS_MIN_VARIANTS = 2;          // require at least 2 target variants to be "dubious"
+
+function buildBasePhraseTableForDownloads(phrases, opts = {}) {
+  const {
+    minTotal = 1,
+    topK = 10,
+  } = opts;
+
+  return buildPhraseTranslationTable(phrases, {
+    includeSingleWord: true,
+    includeMultiWord: true,
+    minTotal,
+    topK,
+    splitByDirection: true,
+  });
+}
+
+export function downloadSurePhraseTableCSV(project_id) {
+  const phrases = getCachedExtractedPhrases(project_id);
+  if (!phrases) {
+    alert(`No extracted phrases cached for project ${project_id}.\nRun "Extract phrases" first (same session).`);
+    return;
+  }
+
+  const base = buildBasePhraseTableForDownloads(phrases, { minTotal: DEFAULT_FILTER_MIN_TOTAL, topK: 10 });
+
+  const sure = filterPhraseTranslationTable(base, (r) =>
+    r.total >= DEFAULT_FILTER_MIN_TOTAL &&
+    r.top_share >= SURE_TOP_SHARE
+  );
+
+  const csv = phraseTranslationTableToCSV(sure);
+  const ts = new Date().toISOString().replace(/[:]/g, "-");
+  downloadTextFile(`sure_phrases_project_${project_id}_${ts}.csv`, csv);
+}
+
+export function downloadDubiousPhraseTableCSV(project_id) {
+  const phrases = getCachedExtractedPhrases(project_id);
+  if (!phrases) {
+    alert(`No extracted phrases cached for project ${project_id}.\nRun "Extract phrases" first (same session).`);
+    return;
+  }
+
+  const base = buildBasePhraseTableForDownloads(phrases, { minTotal: DEFAULT_FILTER_MIN_TOTAL, topK: 10 });
+
+  const dubious = filterPhraseTranslationTable(base, (r) =>
+    r.total >= DEFAULT_FILTER_MIN_TOTAL &&
+    r.num_tgts >= DUBIOUS_MIN_VARIANTS &&
+    r.top_share <= DUBIOUS_TOP_SHARE
+  );
+
+  const csv = phraseTranslationTableToCSV(dubious);
+  const ts = new Date().toISOString().replace(/[:]/g, "-");
+  downloadTextFile(`dubious_phrases_project_${project_id}_${ts}.csv`, csv);
+}
+
+// Optional JSON versions (handy later for automation)
+export function downloadSurePhraseTableJSON(project_id) {
+  const phrases = getCachedExtractedPhrases(project_id);
+  if (!phrases) {
+    alert(`No extracted phrases cached for project ${project_id}.\nRun "Extract phrases" first (same session).`);
+    return;
+  }
+
+  const base = buildBasePhraseTableForDownloads(phrases, { minTotal: DEFAULT_FILTER_MIN_TOTAL, topK: 10 });
+  const sure = filterPhraseTranslationTable(base, (r) =>
+    r.total >= DEFAULT_FILTER_MIN_TOTAL &&
+    r.top_share >= SURE_TOP_SHARE
+  );
+
+  const ts = new Date().toISOString().replace(/[:]/g, "-");
+  downloadTextFile(`sure_phrases_project_${project_id}_${ts}.json`, JSON.stringify(sure, null, 2));
+}
+
+export function downloadDubiousPhraseTableJSON(project_id) {
+  const phrases = getCachedExtractedPhrases(project_id);
+  if (!phrases) {
+    alert(`No extracted phrases cached for project ${project_id}.\nRun "Extract phrases" first (same session).`);
+    return;
+  }
+
+  const base = buildBasePhraseTableForDownloads(phrases, { minTotal: DEFAULT_FILTER_MIN_TOTAL, topK: 10 });
+  const dubious = filterPhraseTranslationTable(base, (r) =>
+    r.total >= DEFAULT_FILTER_MIN_TOTAL &&
+    r.num_tgts >= DUBIOUS_MIN_VARIANTS &&
+    r.top_share <= DUBIOUS_TOP_SHARE
+  );
+
+  const ts = new Date().toISOString().replace(/[:]/g, "-");
+  downloadTextFile(`dubious_phrases_project_${project_id}_${ts}.json`, JSON.stringify(dubious, null, 2));
+}
+
+// --- Robustness report cache keys (stored in localStorage) ---
+const ROBUSTNESS_CACHE_KEY_TEXT = (projectId) =>
+  `alignfix:robustness_report_text:${projectId}`;
+const ROBUSTNESS_CACHE_KEY_JSON = (projectId) =>
+  `alignfix:robustness_report_json:${projectId}`;
+
+function cacheRobustnessReport(projectId, phrasesArray) {
+  try {
+    const report = buildTranslationRobustnessReport(phrasesArray, {
+      singleWordOnly: true,
+      minTotal: 30,
+      robustTopShare: 0.85,
+      nonRobustTopShare: 0.60,
+      maxExamples: 25,
+      maxAlternativesShown: 6,
+    });
+
+    const text = robustnessReportToText(report);
+
+    localStorage.setItem(ROBUSTNESS_CACHE_KEY_JSON(projectId), JSON.stringify(report));
+    localStorage.setItem(ROBUSTNESS_CACHE_KEY_TEXT(projectId), text);
+
+    console.log(
+      `✅ Robustness report cached for project ${projectId}. ` +
+      `Use "Download Robustness Report" in the Project tab to export it.`
+    );
+  } catch (e) {
+    console.warn("⚠️ Robustness report generation/caching failed:", e);
+  }
+}
+
+// IMPORTANT: synchronous download (no awaits) so browsers allow it
+export function downloadRobustnessReport(projectId) {
+  const text = localStorage.getItem(ROBUSTNESS_CACHE_KEY_TEXT(projectId));
+  if (!text) {
+    alert(
+      `No robustness report cached for project ${projectId}.\n\n` +
+      `Run "Extract phrases" first, then try again.`
+    );
+    return;
+  }
+  const ts = new Date().toISOString().replace(/[:]/g, "-");
+  downloadTextFile(`robustness_report_project_${projectId}_${ts}.txt`, text);
+}
+
+function downloadTextFile(filename, text) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function buildTranslationRobustnessReport(phrasesArray, opts = {}) {
+  const {
+    // Start simple: only analyze single-word sources
+    singleWordOnly = true,
+
+    // Ignore rare words so the stats mean something
+    minTotal = 30,
+
+    // "Robust": top translation dominates
+    robustTopShare = 0.85,
+
+    // "Non-robust": lots of competition
+    nonRobustTopShare = 0.60,
+
+    // How many examples to include
+    maxExamples = 25,
+
+    // How many alternative translations to show per source
+    maxAlternativesShown = 6,
+  } = opts;
+
+  const isSingleWord = (s) => !/\s/.test((s || "").trim());
+
+  // src -> (tgt -> count)
+  const src2tgt = new Map();
+
+  for (const p of phrasesArray || []) {
+    const src = (p.src_phrase || "").trim();
+    const tgt = (p.tgt_phrase || "").trim();
+    const c = Number(p.num_occurrences || 0);
+
+    if (!src || !tgt || !Number.isFinite(c) || c <= 0) continue;
+    if (singleWordOnly && !isSingleWord(src)) continue;
+
+    let m = src2tgt.get(src);
+    if (!m) {
+      m = new Map();
+      src2tgt.set(src, m);
+    }
+    m.set(tgt, (m.get(tgt) || 0) + c);
+  }
+
+  const robust = [];
+  const nonRobust = [];
+
+  for (const [src, tgtMap] of src2tgt.entries()) {
+    const entries = Array.from(tgtMap.entries()).sort((a, b) => b[1] - a[1]);
+    if (entries.length === 0) continue;
+
+    const total = entries.reduce((acc, [, c]) => acc + c, 0);
+    if (total < minTotal) continue;
+
+    const [topTgt, topCount] = entries[0];
+    const topShare = topCount / total;
+
+    const record = {
+      src,
+      topTgt,
+      topCount,
+      topShare,
+      total,
+      numTranslations: entries.length,
+      alternatives: entries.slice(1, 1 + maxAlternativesShown), // [ [tgt, count], ... ]
+      topAll: entries.slice(0, maxAlternativesShown),            // include top list for non-robust
+    };
+
+    if (topShare >= robustTopShare) {
+      robust.push(record);
+    } else if (entries.length >= 2 && topShare <= nonRobustTopShare) {
+      nonRobust.push(record);
+    }
+  }
+
+  robust.sort((a, b) => b.total - a.total);
+  nonRobust.sort((a, b) => b.total - a.total);
+
+  return {
+    params: { singleWordOnly, minTotal, robustTopShare, nonRobustTopShare, maxExamples, maxAlternativesShown },
+    counts: {
+      candidates: src2tgt.size,
+      robust_found: robust.length,
+      nonrobust_found: nonRobust.length,
+    },
+    robust_examples: robust.slice(0, maxExamples),
+    nonrobust_examples: nonRobust.slice(0, maxExamples),
+  };
+}
+
+function robustnessReportToText(report) {
+  const fmtPct = (x) => `${(x * 100).toFixed(1)}%`;
+
+  const lines = [];
+  lines.push("TRANSLATION ROBUSTNESS REPORT");
+  lines.push("");
+  lines.push("PARAMS:");
+  lines.push(JSON.stringify(report.params, null, 2));
+  lines.push("");
+  lines.push("COUNTS:");
+  lines.push(JSON.stringify(report.counts, null, 2));
+  lines.push("");
+  lines.push("✅ ROBUST EXAMPLES (top translation dominates):");
+  lines.push("");
+
+  for (const r of report.robust_examples) {
+    const alts = r.alternatives.map(([t, c]) => `${t} (${c})`).join(", ");
+    lines.push(
+      `[ROBUST] ${r.src} → ${r.topTgt} | top=${fmtPct(r.topShare)} (${r.topCount}/${r.total}), variants=${r.numTranslations}` +
+      (alts ? ` | alts: ${alts}` : "")
+    );
+  }
+
+  lines.push("");
+  lines.push("⚠️ NON-ROBUST EXAMPLES (competing translations):");
+  lines.push("");
+
+  for (const r of report.nonrobust_examples) {
+    const tops = r.topAll.map(([t, c]) => `${t} (${c})`).join(", ");
+    lines.push(
+      `[NON-ROBUST] ${r.src} | top=${r.topTgt} ${fmtPct(r.topShare)} (${r.topCount}/${r.total}), variants=${r.numTranslations}` +
+      (tops ? ` | top list: ${tops}` : "")
+    );
+  }
+
+  lines.push("");
+  return lines.join("\n");
+}
+
 function trimPhrase(phrase) {
   // trim #NB at start and end of phrases
   return phrase.replace(/^#NB\s+/, '').replace(/\s+#NB$/, '');
@@ -528,6 +1047,11 @@ export async function extractPhrases(project_id) {
       ignore_pairs
     );
     
+    cacheExtractedPhrases(project_id, phrases);
+
+    // --- Build + cache robustness report (download happens via a dedicated button) ---
+    cacheRobustnessReport(project_id, phrases);
+    
     try {
         pyodide.globals.set("project_id", project_id);
         const startDeleteTime = performance.now();
@@ -787,4 +1311,13 @@ export async function downloadPhrases(project_id) {
   a.click();
   document.body.removeChild(a);
 
+  // also download robustness report if available
+  try {
+    await downloadRobustnessReport(project_id);
+  } catch (e) {
+    console.warn("Could not download robustness report:", e);
+  }
+
 }
+
+
