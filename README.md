@@ -61,6 +61,20 @@ review.
 
 ------------------------------------------------------------------------
 
+AlignFix generates the following report files after phrase extraction:
+
+- Phrase Table (CSV / JSON)
+Complete table of all extracted phrases with statistics and confidence scores.
+
+- Sure Phrases (CSV / JSON)
+High-confidence phrases (consistent translations).
+
+- Dubious Phrases (CSV / JSON)
+Low-confidence phrases (inconsistent translations).
+
+- Robustness Report (TXT)
+Summary overview with example “robust” and “non-robust” phrases.
+
 What the Exported Files Contain
 
 The CSV/JSON reports include:

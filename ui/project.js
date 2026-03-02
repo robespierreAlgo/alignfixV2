@@ -29,7 +29,8 @@ import {
   downloadSurePhraseTableCSV,
   downloadDubiousPhraseTableCSV,
   downloadSurePhraseTableJSON,
-  downloadDubiousPhraseTableJSON
+  downloadDubiousPhraseTableJSON,
+  downloadSurePhrasesAsHiddenJSON
 } from "../backend/js/phrases.js";
 import { fetchTranslations, storeTranslation, deleteTranslation } from "../backend/js/alignments.js";
 import { applyFixes } from "../backend/js/fixes.js";
@@ -67,7 +68,7 @@ export async function renderProject(id) {
   const app = document.getElementById("app");
 
   const project = await getProject(id);
-  const numCores = navigator.hardwareConcurrency || 1;
+  const numCores = Math.min(4, navigator.hardwareConcurrency || 4);
 
   app.innerHTML = `
   <div class="d-flex flex-column flex-md-row align-items-start align-items-md-center justify-content-between mb-2">
@@ -125,6 +126,9 @@ export async function renderProject(id) {
         </button>
         <button id="download-dubious-phrases-json-btn" class="btn btn-outline-secondary btn-sm">
           Download Dubious Phrases (JSON)
+        </button>
+        <button id="download-sure-hidden-btn" class="btn btn-warning btn-sm" title="Export Sure phrases as uploadable Hidden phrases JSON">
+          <i class="fas fa-eye-slash me-1"></i> Download excluding phrases
         </button>
       </div>
       <!-- Fixes Preview -->
@@ -392,6 +396,9 @@ export async function renderProject(id) {
 
   const dubJsonBtn = document.getElementById("download-dubious-phrases-json-btn");
   if (dubJsonBtn) dubJsonBtn.addEventListener("click", () => downloadDubiousPhraseTableJSON(id));
+
+  const sureHiddenBtn = document.getElementById("download-sure-hidden-btn");
+  if (sureHiddenBtn) sureHiddenBtn.addEventListener("click", () => downloadSurePhrasesAsHiddenJSON(id));
 
   // Initialize Bootstrap tooltips
   const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));

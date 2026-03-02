@@ -263,9 +263,8 @@ function filterPhraseTranslationTable(table, predicate) {
 
 // Tune these defaults as you like:
 const DEFAULT_FILTER_MIN_TOTAL = 10;     // lower than 30 because multi-word phrases are rarer
-const SURE_TOP_SHARE = 0.90;             // "sure" if top translation ≥ 90%
-const DUBIOUS_TOP_SHARE = 0.60;          // "dubious" if top translation ≤ 60%
-const DUBIOUS_MIN_VARIANTS = 2;          // require at least 2 target variants to be "dubious"
+const SPLIT_TOP_SHARE = 0.75;   // split point
+const SURE_TOP_SHARE = SPLIT_TOP_SHARE;
 
 function buildBasePhraseTableForDownloads(phrases, opts = {}) {
   const {
@@ -312,8 +311,7 @@ export function downloadDubiousPhraseTableCSV(project_id) {
 
   const dubious = filterPhraseTranslationTable(base, (r) =>
     r.total >= DEFAULT_FILTER_MIN_TOTAL &&
-    r.num_tgts >= DUBIOUS_MIN_VARIANTS &&
-    r.top_share <= DUBIOUS_TOP_SHARE
+    r.top_share < SURE_TOP_SHARE
   );
 
   const csv = phraseTranslationTableToCSV(dubious);
@@ -321,7 +319,6 @@ export function downloadDubiousPhraseTableCSV(project_id) {
   downloadTextFile(`dubious_phrases_project_${project_id}_${ts}.csv`, csv);
 }
 
-// Optional JSON versions (handy later for automation)
 export function downloadSurePhraseTableJSON(project_id) {
   const phrases = getCachedExtractedPhrases(project_id);
   if (!phrases) {
@@ -339,6 +336,60 @@ export function downloadSurePhraseTableJSON(project_id) {
   downloadTextFile(`sure_phrases_project_${project_id}_${ts}.json`, JSON.stringify(sure, null, 2));
 }
 
+// Download "Sure phrases" as a JSON list that can be uploaded as "Hidden phrases".
+// Output format: [{ "src": "...", "tgt": "..." }, ...]
+// (tgt is optional in the importer, but we include it to hide the exact pair.)
+export function downloadSurePhrasesAsHiddenJSON(project_id, opts = {}) {
+  const {
+    // Avoid accidentally exporting reverse-direction rows as hidden phrases.
+    // In this codebase direction is usually "1" (src→tgt), "-1" (tgt→src), "0" (↔).
+    directions = new Set(["1", "0"]),
+    includeTgt = true,
+    dedupe = true,
+  } = opts;
+
+  const phrases = getCachedExtractedPhrases(project_id);
+  if (!phrases) {
+    alert(`No extracted phrases cached for project ${project_id}.\nRun "Extract phrases" first (same session).`);
+    return;
+  }
+
+  const base = buildBasePhraseTableForDownloads(phrases, { minTotal: DEFAULT_FILTER_MIN_TOTAL, topK: 10 });
+  const sure = filterPhraseTranslationTable(base, (r) =>
+    r.total >= DEFAULT_FILTER_MIN_TOTAL &&
+    r.top_share >= SURE_TOP_SHARE
+  );
+
+  const out = [];
+  const seen = new Set();
+
+  for (const r of (sure.rows || [])) {
+    const dir = String(r.direction ?? "");
+    if (directions && !directions.has(dir)) continue;
+
+    const src = (r.src || "").trim();
+    const tgt = (r.top_tgt || "").trim();
+
+    if (!src) continue;
+
+    const entry = includeTgt ? { src, tgt } : { src };
+
+    if (dedupe) {
+      const key = includeTgt ? `${src}\u0000${tgt}` : src;
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+
+    out.push(entry);
+  }
+
+  const ts = new Date().toISOString().replace(/[:]/g, "-");
+  downloadTextFile(
+    `hidden_phrases_from_sure_project_${project_id}_${ts}.json`,
+    JSON.stringify(out, null, 2)
+  );
+}
+
 export function downloadDubiousPhraseTableJSON(project_id) {
   const phrases = getCachedExtractedPhrases(project_id);
   if (!phrases) {
@@ -349,8 +400,7 @@ export function downloadDubiousPhraseTableJSON(project_id) {
   const base = buildBasePhraseTableForDownloads(phrases, { minTotal: DEFAULT_FILTER_MIN_TOTAL, topK: 10 });
   const dubious = filterPhraseTranslationTable(base, (r) =>
     r.total >= DEFAULT_FILTER_MIN_TOTAL &&
-    r.num_tgts >= DUBIOUS_MIN_VARIANTS &&
-    r.top_share <= DUBIOUS_TOP_SHARE
+    r.top_share < SURE_TOP_SHARE
   );
 
   const ts = new Date().toISOString().replace(/[:]/g, "-");
@@ -1024,7 +1074,8 @@ export async function extractPhrases(project_id) {
     console.log('progress:5');
 
 
-    const numCores = parseInt(document.getElementById("num-cores-input")?.value) || window.navigator.hardwareConcurrency || 1;
+    //const numCores = parseInt(document.getElementById("num-cores-input")?.value) || window.navigator.hardwareConcurrency || 1;
+    const numCores = parseInt(document.getElementById("num-cores-input")?.value, 10) || 4;
 
     // Initialize WASM module
     console.log('operation:Initializing WASM extraction module');

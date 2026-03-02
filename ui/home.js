@@ -347,7 +347,7 @@ ${tgtStats.sample.join('\n--\n')}</div>
       
       if (maxLinesInput) {
         maxLinesInput.max = srcLinesRaw.length;
-        maxLinesInput.value = srcLinesRaw.length;
+        maxLinesInput.value = Math.min(srcLinesRaw.length, 5000);
         maxLinesInput.placeholder = `Max: ${srcLinesRaw.length.toLocaleString()}`;
       }
     }
