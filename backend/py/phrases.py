@@ -13,6 +13,41 @@ import time
 PHRASE_EXTRACTION_CHUNK_SIZE = 25_000
 MAX_OCCURRENCES_PER_CHUNK = 300
 MAX_NUM_PHRASES = 100_000
+_IGNORED_UNIQUE_READY = False
+
+_IGNORED_UNIQUE_READY = False
+
+def ensure_ignored_unique_indexes():
+    global _IGNORED_UNIQUE_READY
+    if _IGNORED_UNIQUE_READY:
+        return
+
+    conn, cur = get_db()
+
+    # speed lookups + dedupe
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ignored_proj_src_tgt
+        ON ignored(project_id, src_phrase, tgt_phrase)
+    """)
+
+    # dedupe existing (keep smallest id)
+    cur.execute("""
+        DELETE FROM ignored
+        WHERE id NOT IN (
+            SELECT MIN(id)
+            FROM ignored
+            GROUP BY project_id, src_phrase, tgt_phrase
+        )
+    """)
+
+    # enforce uniqueness going forward
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ignored_unique
+        ON ignored(project_id, src_phrase, tgt_phrase)
+    """)
+
+    conn.commit()
+    _IGNORED_UNIQUE_READY = True
 
 def chunked(iterable, size):
     it = iter(iterable)
@@ -620,155 +655,68 @@ def fetch_phrases(project_id, start, length, search_value, direction=0, min_leng
 
     return phrase_ids, src_phrases, tgt_phrases, directions, num_occurrences, total_records, filtered_records
 
-# def fetch_ignored_phrases(project_id, start, length):
-#     _, cursor = get_db()
-
-#     # Collect all ignored phrases from both sources
-#     all_phrases = []
-
-#     # 1) Get phrases from phrases table where ignore=1
-#     cursor.execute("""SELECT id, src_phrase, tgt_phrase, 0 as imported
-#                       FROM phrases
-#                       WHERE project_id=? AND ignore=1
-#                       ORDER BY num_occurrences DESC""", (project_id,))
-#     phrases_ignored = cursor.fetchall()
-#     all_phrases.extend(phrases_ignored)
-
-#     # 2) Get additional phrases from ignored table
-#     additional_phrases = get_phrases_to_ignore(project_id)
-#     for (id, src, tgt) in additional_phrases:
-#         all_phrases.append((id, src, tgt, 1))  # 1 = imported
-    
-#     # 3) Calculate total count
-#     total_records = len(all_phrases)
-
-#     # 4) Apply pagination
-#     paginated_phrases = all_phrases[start:start + length]
-
-#     # 5) Build result arrays
-#     phrase_ids = []
-#     src_phrases = []
-#     tgt_phrases = []
-#     imported = []
-
-#     for row in paginated_phrases:
-#         phrase_ids.append(row[0])
-#         src_phrases.append(detokenise(row[1]))
-#         tgt_phrases.append(detokenise(row[2]))
-#         imported.append(row[3])
-
-#     return phrase_ids, src_phrases, tgt_phrases, imported, total_records
-
 def fetch_ignored_phrases(project_id, start, length):
-    _, cursor = get_db()
+    ensure_ignored_unique_indexes()
+    _, cur = get_db()
 
-    # total count = ignored in phrases + imported ignored table
-    cursor.execute("""
-        SELECT
-          (SELECT COUNT(*) FROM phrases WHERE project_id=? AND ignore=1) +
-          (SELECT COUNT(*) FROM ignored WHERE project_id=?)
-    """, (project_id, project_id))
-    total_records = cursor.fetchone()[0]
+    # total distinct imported pairs
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM ignored
+        WHERE project_id=?
+    """, (project_id,))
+    total = cur.fetchone()[0]
 
-    # paginate in SQL (no huge Python lists)
-    cursor.execute("""
-        SELECT id, src_phrase, tgt_phrase, imported
-        FROM (
-          SELECT id, src_phrase, tgt_phrase, 0 AS imported, num_occurrences AS score
-          FROM phrases
-          WHERE project_id=? AND ignore=1
-
-          UNION ALL
-
-          SELECT id, src_phrase, tgt_phrase, 1 AS imported, NULL AS score
-          FROM ignored
-          WHERE project_id=?
-        )
-        ORDER BY (score IS NULL) ASC, score DESC
+    cur.execute("""
+        SELECT id, src_phrase, tgt_phrase, 1 AS imported
+        FROM ignored
+        WHERE project_id=?
+        ORDER BY id DESC
         LIMIT ? OFFSET ?
-    """, (project_id, project_id, length, start))
+    """, (project_id, length, start))
 
-    rows = cursor.fetchall()
+    rows = cur.fetchall()
+    ids = [r[0] for r in rows]
+    srcs = [detokenise(r[1]) for r in rows]
+    tgts = [detokenise(r[2]) for r in rows]
+    imported = [r[3] for r in rows]
+    return ids, srcs, tgts, imported, total
 
-    phrase_ids, src_phrases, tgt_phrases, imported = [], [], [], []
-    for pid, src, tgt, imp in rows:
-        phrase_ids.append(pid)
-        src_phrases.append(detokenise(src))
-        tgt_phrases.append(detokenise(tgt))
-        imported.append(imp)
-
-    return phrase_ids, src_phrases, tgt_phrases, imported, total_records
-
-""" def import_ignored_from_file(project_id, file_content):
-    
-    try:
-        ignored_phrases = json.loads(file_content)
-        if not isinstance(ignored_phrases, list):
-            print("Invalid format: JSON is not a list")
-            return 0
-        
-        phrases = []
-        for phrase in ignored_phrases:
-            src_phrase = tokenise(phrase.get("src", ""), as_string=True)
-            tgt_phrase = tokenise(phrase.get("tgt", ""), as_string=True)
-            phrases.append({"src_phrase": src_phrase, "tgt_phrase": tgt_phrase})
-        
-        add_phrases_to_ignore(project_id, phrases)
-        print(f"Imported {len(phrases)} ignored phrases for project {project_id}")
-
-        return len(phrases)
-
-    except json.JSONDecodeError as e:
-        print(f"JSON decode error: {e}")
-        return 0
- """
-
-# UPDATE 08.02.26
+# update 04.03.26
 def import_ignored_from_file(project_id, file_content):
+    ensure_ignored_unique_indexes()
+
     try:
-        ignored_phrases = json.loads(file_content)
-    except json.JSONDecodeError as e:
-        print(f"JSON decode error: {e}")
+        data = json.loads(file_content)
+    except json.JSONDecodeError:
         return 0
 
-    if not isinstance(ignored_phrases, list):
-        print("Invalid format: JSON is not a list")
+    if not isinstance(data, list):
         return 0
 
-    phrases = []
-    skipped = 0
-
-    for entry in ignored_phrases:
-        # accept either {"src": "...", "tgt": "..."} or {"src": "..."} (tgt optional)
-        if not isinstance(entry, dict):
-            skipped += 1
+    rows = []
+    for it in data:
+        if not isinstance(it, dict):
             continue
-
-        src_raw = entry.get("src", "")
-        tgt_raw = entry.get("tgt", "")  # may be missing/empty
-
-        # tokenise() returns "" for empty input; that's fine for tgt
-        src_phrase = " ".join(strip_nb_bl((src_raw or "").strip().split()))
-        tgt_phrase = " ".join(strip_nb_bl((tgt_raw or "").strip().split()))
-
-        # IMPORTANT: require src to be non-empty, but allow empty tgt
-        if not src_phrase:
-            skipped += 1
+        src = (it.get("src") or "").strip()
+        tgt = (it.get("tgt") or "").strip()  # may be ""
+        if not src:
             continue
+        rows.append((src, tgt, project_id))
 
-        phrases.append({"src_phrase": src_phrase, "tgt_phrase": tgt_phrase})
-
-    if not phrases:
-        print("No valid ignored phrases found to import")
+    if not rows:
         return 0
 
-    add_phrases_to_ignore(project_id, phrases)
+    conn, cur = get_db()
+    cur.executemany("""
+        INSERT OR IGNORE INTO ignored(src_phrase, tgt_phrase, project_id)
+        VALUES (?, ?, ?)
+    """, rows)
+    conn.commit()
 
-    # actually hide phrases (and apply combination rule)
-    apply_imported_ignored_to_phrases(project_id)
-    print(f"Imported {len(phrases)} ignored phrases for project {project_id} (skipped {skipped})")
-
-    return len(phrases)
+    # optional: if you still want phrases.ignore to be set too, call apply_imported_ignored_to_phrases(project_id)
+    # but note: that can increase "hidden" count beyond JSON due to combination rule.
+    return len(rows)
 
 # UPDATE 08.02.26
 # import unicodedata

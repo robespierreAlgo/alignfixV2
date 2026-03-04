@@ -903,7 +903,6 @@ function buildRobustAndFormHiddenArtifacts(project_id, opts = {}) {
   lines.push("- only single-token source forms");
   lines.push("- Italian head token extraction is conservative (det+head, elision l'/un' etc.)");
   lines.push("- Ladin tag (formario_lavb.csv) matched against Italian Morph-it features (morphit_it.txt)");
-  lines.push(`- params: ${JSON.stringify(formParams, null, 2)}`);
   lines.push("");
 
   lines.push("COUNTS:");
@@ -1176,38 +1175,31 @@ function robustnessReportToText(report) {
   lines.push(JSON.stringify(report.counts, null, 2));
   lines.push("");
 
-  lines.push("FORM-ALIGNED CANDIDATES (THIS RUN):");
-  lines.push(`- Candidates due to form alignment (downloadable): ${(extra.form_aligned_candidates ?? 0).toLocaleString()}`);
+  const c = report.counts || {};
+  const totalSrc = Number(c.unique_src_considered ?? 0);    // src phrases in scope (after direction+singleWordOnly)
+  const excludedSrc = Number(c.below_minTotal ?? 0);        // src phrases excluded (< minTotal)
+  const classifiedSrc = Number(c.classified_total ?? 0);    // src phrases classified (>= minTotal)
+  const sureSrc = Number(c.sure_found ?? 0);
+  const dubiousSrc = Number(c.dubious_found ?? 0);
+
+  const totalPairs = Number(extra.total_phrase_pairs_extracted ?? 0); // phrase pairs (different unit!)
+
+  lines.push("TOTALS (SOURCE PHRASES IN REPORT SCOPE):");
+  lines.push(`- overall considered: ${totalSrc.toLocaleString()}`);
+  lines.push(`- classified (>= minTotal): ${classifiedSrc.toLocaleString()} (sure=${sureSrc.toLocaleString()}, dubious=${dubiousSrc.toLocaleString()})`);
+  lines.push(`- excluded (< minTotal): ${excludedSrc.toLocaleString()}`);
+  lines.push(`- check: classified + excluded = ${ (classifiedSrc + excludedSrc).toLocaleString() }`);
   lines.push("");
 
-  if (Array.isArray(extra.form_aligned_examples) && extra.form_aligned_examples.length) {
-    lines.push("FORM-ALIGNMENT EXAMPLES (Ladin tag matched Italian Morph-it feature):");
-    for (const ex of extra.form_aligned_examples) {
-      lines.push(`- ${ex.src} → ${ex.tgt} (head: ${ex.tgt_head})   [${ex.ladin_tag}] ⇄ [${ex.italian_feat}]`);
-    }
-    lines.push("");
-  }
+  lines.push("RAW EXTRACTION (PHRASE PAIRS, DIFFERENT UNIT):");
+  lines.push(`- extracted phrase pairs (after extraction filters): ${totalPairs.toLocaleString()}`);
+  lines.push("");
 
-  lines.push("✅ SURE/ROBUST EXAMPLES:");
+  lines.push("MANUAL REVIEW (SOURCE PHRASES):");
+  lines.push(`- dubious (>= minTotal but conf < split): ${dubiousSrc.toLocaleString()}`);
+  lines.push(`- excluded (< minTotal, not classified): ${excludedSrc.toLocaleString()}`);
+  lines.push(`- total potentially to review: ${(dubiousSrc + excludedSrc).toLocaleString()}`);
   lines.push("");
-  for (const r of report.sure_examples || []) {
-    const tops = (r.topAll || []).map(([t, c]) => `${t} (${c})`).join(", ");
-    lines.push(
-      `[SURE] ${r.src} → ${r.topTgt} | conf=${fmtPct(r.topShare)} (${r.topCount}/${r.total}), variants=${r.numTranslations}` +
-      (tops ? ` | top list: ${tops}` : "")
-    );
-  }
-
-  lines.push("");
-  lines.push("⚠️ DUBIOUS EXAMPLES:");
-  lines.push("");
-  for (const r of report.dubious_examples || []) {
-    const tops = (r.topAll || []).map(([t, c]) => `${t} (${c})`).join(", ");
-    lines.push(
-      `[DUBIOUS] ${r.src} | top=${r.topTgt} conf=${fmtPct(r.topShare)} (${r.topCount}/${r.total}), variants=${r.numTranslations}` +
-      (tops ? ` | top list: ${tops}` : "")
-    );
-  }
 
   lines.push("");
   return lines.join("\n");
@@ -1770,6 +1762,9 @@ export async function extractPhrases(project_id) {
         }
 
         cacheRobustnessReport(project_id, phrases, {
+          // overall phrase pairs currently in memory (after extraction filters)
+          total_phrase_pairs_extracted: Array.isArray(phrases) ? phrases.length : 0,
+
           form_aligned_candidates: stats_obj.form_aligned_candidates ?? 0,
           form_aligned_examples: stats_obj.form_aligned_examples ?? [],
         });
@@ -2004,29 +1999,39 @@ export async function downloadPhrases(project_id) {
   a.click();
   document.body.removeChild(a);
 
-  // also download robustness report if available
-  try {
-    await downloadRobustnessReport(project_id);
-  } catch (e) {
-    console.warn("Could not download robustness report:", e);
-  }
-
 }
 
 export function downloadPhrasesExcludingReport(project_id) {
-  const { reportText } = buildRobustAndFormHiddenArtifacts(project_id, {
-    robustDirections: new Set(["0"]),
-    robustSingleTokenOnly: false,
-    robustMinTotal: DEFAULT_FILTER_MIN_TOTAL,
-    robustConfidenceSplit: SURE_TOP_SHARE,
-    maxExamplesPerGroup: 12,
-  });
-
   const ts = new Date().toISOString().replace(/[:]/g, "-");
-  downloadTextFile(
-    `phrases_excluding_report_robust+form_project_${project_id}_${ts}.txt`,
-    reportText
-  );
+
+  // 1) Translation overview text (cached from last extraction)
+  const overviewText =
+    localStorage.getItem(ROBUSTNESS_CACHE_KEY_TEXT(project_id)) ||
+    `No translation overview cached for project ${project_id}.\nRun "Extract phrases" first.\n`;
+
+  // 2) Hidden-selection report (robust + form-aligned)
+  //    (does NOT download anything, just returns text)
+  let hiddenSelectionText = "";
+  try {
+    const { reportText } = buildRobustAndFormHiddenArtifacts(project_id, {
+      robustDirections: new Set(["0"]),
+      robustSingleTokenOnly: false,
+      robustMinTotal: DEFAULT_FILTER_MIN_TOTAL,
+      robustConfidenceSplit: SURE_TOP_SHARE,
+      maxExamplesPerGroup: 12,
+    });
+    hiddenSelectionText = reportText;
+  } catch (e) {
+    hiddenSelectionText =
+      `\n\n(Hidden-selection report unavailable: ${e?.message || e})\n`;
+  }
+
+  const combined =
+    `${overviewText}\n` +
+    `\n================================================================\n\n` +
+    `${hiddenSelectionText}\n`;
+
+  downloadTextFile(`excluding_report_project_${project_id}_${ts}.txt`, combined);
 }
 
 

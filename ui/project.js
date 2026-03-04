@@ -23,7 +23,6 @@ import {
   downloadIgnoredPhrases,
   downloadPhrases,
   deleteAllIgnoredPhrases,
-  downloadRobustnessReport,
   downloadPhraseTranslationTableCSV,
   downloadPhraseTranslationTableJSON,
   downloadSurePhraseTableCSV,
