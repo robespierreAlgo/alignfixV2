@@ -20,6 +20,7 @@ import { nextFrame } from "../../ui/utils.js";
 import { getLinesStats } from "./stats.js"; 
 import { safeSyncfs } from "./storage.js";
 
+console.log("phrases.js loaded: v=2026-03-03-TEST");
 const SAVE_BATCH_SIZE = 100000; // adjust based on memory
 
 // =======================
@@ -37,6 +38,410 @@ function cacheExtractedPhrases(projectId, phrasesArray) {
 
 function getCachedExtractedPhrases(projectId) {
   return _LAST_EXTRACTED_PHRASES_BY_PROJECT.get(String(projectId)) || null;
+}
+
+// Cache form-aligned candidates from the last extraction (same session only)
+const _LAST_FORM_ALIGNED_BY_PROJECT = new Map(); // projectId -> { pairs: [{src,tgt}], examples: [...], params: {...} }
+
+function cacheFormAlignedCandidates(projectId, data) {
+  _LAST_FORM_ALIGNED_BY_PROJECT.set(String(projectId), data || { pairs: [], examples: [], params: {} });
+}
+
+function getCachedFormAlignedCandidates(projectId) {
+  return _LAST_FORM_ALIGNED_BY_PROJECT.get(String(projectId)) || null;
+}
+
+// =======================
+// Morphology-driven auto-hide (Ladin -> Italian) using local_data/
+// - Ladin:  local_data/formario_lavb.csv   (id,tag,form)
+// - Italian: local_data/morphit_it.txt     (Morph-it: form<TAB>lemma<TAB>features)
+// =======================
+
+let _FORMARIO_LAVB_TEXT_PROMISE = null;
+let _MORPHIT_TEXT_PROMISE = null;
+
+function _normTok(s) {
+  return (s || "").normalize("NFC").trim().toLowerCase();
+}
+
+function _isSingleToken(s) {
+  return !!s && !/\s/.test(String(s).trim());
+}
+
+const _IT_DET_PREFIX = new Set([
+  "il","lo","la","i","gli","le",
+  "un","uno","una",
+  "del","dello","della","dei","degli","delle",
+  "al","allo","alla","ai","agli","alle",
+  "nel","nello","nella","nei","negli","nelle",
+  "sul","sullo","sulla","sui","sugli","sulle",
+  "da","di","a","in","su","per","con","tra","fra"
+]);
+
+function _cleanItToken(tok) {
+  let t = _normTok(tok);
+  // strip leading/trailing punctuation
+  t = t.replace(/^[^a-zàèéìòóù]+/i, "").replace(/[^a-zàèéìòóù]+$/i, "");
+  // handle l' / un' style elision inside single token
+  t = t.replace(/^(l|un|una|lo|la|d|c|s|m|t)['’]/, "");
+  return t;
+}
+
+function _extractItalianHeadToken(tgtPhrase) {
+  const toks = String(tgtPhrase || "").trim().split(/\s+/).filter(Boolean);
+  if (!toks.length) return null;
+
+  if (toks.length === 1) return _cleanItToken(toks[0]);
+
+  // 2 tokens: article/prep + head
+  if (toks.length === 2 && _IT_DET_PREFIX.has(_normTok(toks[0]))) return _cleanItToken(toks[1]);
+
+  // 3 tokens: e.g. "della buona cosa" (rare) – keep conservative: det+det+head
+  if (toks.length === 3 && _IT_DET_PREFIX.has(_normTok(toks[0])) && _IT_DET_PREFIX.has(_normTok(toks[1])))
+    return _cleanItToken(toks[2]);
+
+  return null; // otherwise skip (avoid false positives)
+}
+
+// Minimal CSV splitter for "id,tag,form" (3 columns).
+// Tag and form in your data do not contain commas, so this is safe.
+function _split3csv(line) {
+  const a = line.indexOf(",");
+  if (a < 0) return [null, null, null];
+  const b = line.indexOf(",", a + 1);
+  if (b < 0) return [line.slice(0, a), line.slice(a + 1).trim(), ""];
+  return [line.slice(0, a), line.slice(a + 1, b).trim(), line.slice(b + 1).trim()];
+}
+
+/**
+ * Parse Ladin formario tag scheme.
+ * Examples:
+ * - sost.masch.sing
+ * - agg.femm.plur
+ * - v.imper.2p-Dat/Acc-A_VOI-LUI/CIO  -> base tag = v.imper.2p
+ */
+function _parseLadinTag(tagStr) {
+  const raw = (tagStr || "").trim();
+  if (!raw) return null;
+
+  // only keep base morph tag before clitic/argument decorations:
+  // v.imper.2p-Dat/...  -> v.imper.2p
+  const base = raw.split(/[-_]/)[0].trim();
+
+  const parts = base
+    .split(".")
+    .map(x => x.trim())
+    .filter(x => x.length > 0);
+
+  if (!parts.length) return null;
+
+  const pos = parts[0]; // 'sost', 'agg', 'v', ...
+
+  const gender =
+    parts.includes("femm") ? "f" :
+    parts.includes("masch") ? "m" :
+    null;
+
+  let number =
+    parts.includes("sing") ? "sing" :
+    parts.includes("plur") ? "plur" :
+    null;
+
+  // Verb details (if present)
+  let mood = null;
+  let person = null;
+
+  if (pos === "v") {
+    mood = parts[1] || null; // e.g. imper, ind, con, inf, part, ger, ...
+
+    // Find token like "2p" or "3s"
+    const pn = parts.find(x => /^\d[ps]$/.test(x));
+    if (pn) {
+      person = parseInt(pn[0], 10);
+      number = pn[1] === "p" ? "plur" : "sing";
+    }
+  }
+
+  return { pos, gender, number, mood, person, parts, raw, base };
+}
+
+// ---- Load text files from local_data/ ----
+
+async function _loadFormarioLavbTextOnce() {
+  if (!_FORMARIO_LAVB_TEXT_PROMISE) {
+    // phrases.js is /backend/js/phrases.js -> ../../local_data/... = /backend/local_data/...
+    const url = new URL("../../local_data/formario_lavb.csv", import.meta.url);
+    _FORMARIO_LAVB_TEXT_PROMISE = fetch(url).then(r => {
+      if (!r.ok) throw new Error(`Cannot fetch formario_lavb.csv (${r.status})`);
+      return r.text();
+    });
+  }
+  return _FORMARIO_LAVB_TEXT_PROMISE;
+}
+
+async function _loadMorphItTextOnce() {
+  if (!_MORPHIT_TEXT_PROMISE) {
+    const url = new URL("../../local_data/morphit_it.txt", import.meta.url);
+    _MORPHIT_TEXT_PROMISE = fetch(url).then(r => {
+      if (!r.ok) throw new Error(`Cannot fetch morphit_it.txt (${r.status})`);
+      return r.text();
+    });
+  }
+  return _MORPHIT_TEXT_PROMISE;
+}
+
+// Build small indexes only for forms we need in THIS extraction (fast + memory-light).
+async function _buildLadinFormIndex(neededSrcFormsSet) {
+  const text = await _loadFormarioLavbTextOnce();
+  const map = new Map(); // norm(form) -> [ladinFeat...]
+
+  for (const line of text.split(/\r?\n/)) {
+    const ln = line.trim();
+    if (!ln) continue;
+
+    const [, tag, form] = _split3csv(ln);
+    if (!tag || !form) continue;
+
+    const key = _normTok(form);
+    if (!neededSrcFormsSet.has(key)) continue;
+
+    const feat = _parseLadinTag(tag);
+    if (!feat) continue;
+
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(feat);
+  }
+  return map;
+}
+
+async function _buildMorphItIndex(neededItFormsSet) {
+  const text = await _loadMorphItTextOnce();
+  const map = new Map(); // norm(form) -> [featureStr...]
+
+  for (const line of text.split(/\r?\n/)) {
+    if (!line) continue;
+    const parts = line.split("\t");
+    if (parts.length < 3) continue;
+
+    const form = parts[0];
+    const feats = parts[2];
+
+    const key = _normTok(form);
+    if (!neededItFormsSet.has(key)) continue;
+
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(feats);
+  }
+  return map;
+}
+
+/**
+ * Parse Morph-it feature string.
+ * Examples from Morph-it docs:
+ * - NOUN-F:s
+ * - ADJ:pos+f+p
+ * - VER:imp+2+p
+ */
+function _parseMorphIt(featStr) {
+  const [left, infl = ""] = (featStr || "").split(":");
+  const leftParts = left.split("-");
+  const pos = leftParts[0] || null;
+
+  const inflParts = infl.split("+").filter(Boolean);
+
+  // number
+  let number = null;
+  if (inflParts.includes("s")) number = "sing";
+  if (inflParts.includes("p")) number = "plur";
+
+  // gender
+  let gender = null;
+  if (leftParts.includes("F")) gender = "f";
+  if (leftParts.includes("M")) gender = "m";
+  if (inflParts.includes("f")) gender = "f";
+  if (inflParts.includes("m")) gender = "m";
+
+  // verb mood + person (if any)
+  let mood = null;
+  let person = null;
+
+  if (pos === "VER") {
+    const moodCand = inflParts.find(x =>
+      ["ind", "con", "cnd", "imp", "inf", "part", "ger"].includes(x)
+    );
+    mood = moodCand || null;
+
+    const persCand = inflParts.find(x => ["1", "2", "3"].includes(x));
+    person = persCand ? parseInt(persCand, 10) : null;
+  }
+
+  return { pos, gender, number, mood, person, raw: featStr };
+}
+
+function _italMatchesLadinByMorphIt(ladinFeat, morphItFeatStrings) {
+  if (!ladinFeat || !morphItFeatStrings?.length) return false;
+
+  // POS mapping
+  const okPos =
+    ladinFeat.pos === "agg"  ? new Set(["ADJ", "VER"]) : // include participles
+    ladinFeat.pos === "sost" ? new Set(["NOUN"]) :
+    ladinFeat.pos === "v"    ? new Set(["VER"]) :
+    null;
+
+  // mood mapping Ladin -> Morph-it
+  const moodMap = {
+    imper: "imp",
+    ind: "ind",
+    con: "con",
+    cnd: "cnd",
+    inf: "inf",
+    ger: "ger",
+    part: "part",
+  };
+
+  for (const s of morphItFeatStrings) {
+    const it = _parseMorphIt(s);
+    if (okPos && !okPos.has(it.pos)) continue;
+
+    // Nouns/adjectives: match gender+number (only if Ladin has them)
+    if ((ladinFeat.pos === "sost" || ladinFeat.pos === "agg") &&
+        ladinFeat.gender && ladinFeat.number) {
+      if (it.gender === ladinFeat.gender && it.number === ladinFeat.number) return true;
+      continue;
+    }
+
+    // Verbs: match mood/person/number when available
+    if (ladinFeat.pos === "v") {
+      const ladMood = ladinFeat.mood;
+      const itMood = it.mood;
+
+      const moodOk =
+        !ladMood || !itMood ? true :
+        (moodMap[ladMood] ? moodMap[ladMood] === itMood : ladMood === itMood);
+
+      const personOk =
+        ladinFeat.person == null || it.person == null ? true : ladinFeat.person === it.person;
+
+      const numberOk =
+        !ladinFeat.number || !it.number ? true : ladinFeat.number === it.number;
+
+      if (moodOk && personOk && numberOk) return true;
+    }
+  }
+
+  return false;
+}
+
+function _findMorphAlignment(ladinFeats, itFeatStrings) {
+  if (!ladinFeats?.length || !itFeatStrings?.length) return null;
+  for (const lf of ladinFeats) {
+    for (const itRaw of itFeatStrings) {
+      // reuse your matcher but return the “witness” features
+      if (_italMatchesLadinByMorphIt(lf, [itRaw])) {
+        return { ladin_tag: lf.base || lf.raw, italian_feat: itRaw };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Auto-add morphology-matching single-token src->tgt pairs to "ignored" (hidden phrases).
+ * Uses existing Python importer: import_ignored_from_file(project_id, json_string)
+ */
+async function _autoAddMorphHiddenPhrases(project_id, phrasesArray, pyodide, opts = {}) {
+  const {
+    allowedDirections = new Set(["0"]),
+    singleTokenOnly = true,
+    maxAdded = 200000,
+    maxExamplePairs = 20,
+    doImport = false, // if false, only compute + return pairs
+  } = opts;
+
+  const candidates = [];
+  const neededSrc = new Set();
+  const neededIt = new Set();
+
+  for (const p of phrasesArray || []) {
+    const dir = String(p.direction ?? "0");
+    if (allowedDirections && !allowedDirections.has(dir)) continue;
+
+    const src = (p.src_phrase || "").trim();
+    const tgt = (p.tgt_phrase || "").trim();
+    if (!src || !tgt) continue;
+
+    if (singleTokenOnly && !_isSingleToken(src)) continue;
+
+    const tgtHead = _extractItalianHeadToken(tgt);
+    if (!tgtHead) continue;
+
+    const ns = _normTok(src);
+    const nt = _normTok(tgtHead);
+
+    neededSrc.add(ns);
+    neededIt.add(nt);
+    candidates.push([src, tgt, ns, nt, tgtHead]);
+  }
+
+  if (!candidates.length) {
+    return { found: 0, imported: 0, pairs: [], examples: [], params: { allowedDirections: Array.from(allowedDirections), singleTokenOnly } };
+  }
+
+  const ladinIndex = await _buildLadinFormIndex(neededSrc);
+  const itIndex = await _buildMorphItIndex(neededIt);
+
+  const toIgnore = [];
+  const seen = new Set();
+  const examples = [];
+
+  for (const [src, tgt, ns, nt, tgtHead] of candidates) {
+    const ladFeats = ladinIndex.get(ns);
+    const itFeats = itIndex.get(nt);
+    if (!ladFeats || !itFeats) continue;
+
+    const matchInfo = _findMorphAlignment(ladFeats, itFeats);
+    if (!matchInfo) continue;
+
+    const key = `${src}\u0000${tgt}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    toIgnore.push({ src, tgt });
+
+    if (examples.length < maxExamplePairs) {
+      examples.push({
+        src,
+        tgt,
+        tgt_head: tgtHead,
+        ladin_tag: matchInfo.ladin_tag,
+        italian_feat: matchInfo.italian_feat,
+      });
+    }
+
+    if (toIgnore.length >= maxAdded) break;
+  }
+
+  if (!toIgnore.length) {
+    return { found: 0, imported: 0, pairs: [], examples: [], params: { allowedDirections: Array.from(allowedDirections), singleTokenOnly } };
+  }
+
+  if (doImport) {
+    pyodide.globals.set("project_id", project_id);
+    pyodide.globals.set("file_content", JSON.stringify(toIgnore));
+    await pyodide.runPythonAsync(`
+from phrases import import_ignored_from_file
+import_ignored_from_file(project_id, file_content)
+    `);
+    pyodide.globals.delete("file_content");
+  }
+
+  return {
+    found: toIgnore.length,
+    imported: doImport ? toIgnore.length : 0,
+    pairs: toIgnore,
+    examples,
+    params: { allowedDirections: Array.from(allowedDirections), singleTokenOnly, maxAdded, maxExamplePairs, doImport }
+  };
 }
 
 function _csvEscape(v) {
@@ -336,32 +741,40 @@ export function downloadSurePhraseTableJSON(project_id) {
   downloadTextFile(`sure_phrases_project_${project_id}_${ts}.json`, JSON.stringify(sure, null, 2));
 }
 
-// Download "Sure phrases" as a JSON list that can be uploaded as "Hidden phrases".
-// Output format: [{ "src": "...", "tgt": "..." }, ...]
-// (tgt is optional in the importer, but we include it to hide the exact pair.)
 export function downloadSurePhrasesAsHiddenJSON(project_id, opts = {}) {
+  const { union } = buildRobustAndFormHiddenArtifacts(project_id, {
+    robustDirections: opts.directions || new Set(["0"]),
+    robustSingleTokenOnly: false,
+    robustMinTotal: DEFAULT_FILTER_MIN_TOTAL,
+    robustConfidenceSplit: SURE_TOP_SHARE,
+    maxExamplesPerGroup: 12,
+  });
+
+  const ts = new Date().toISOString().replace(/[:]/g, "-");
+  downloadTextFile(
+    `hidden_phrases_robust+form_project_${project_id}_${ts}.json`,
+    JSON.stringify(union, null, 2)
+  );
+}
+
+function _buildRobustHiddenCandidatesFromCachedPhrases(project_id, opts = {}) {
   const {
-    // Avoid accidentally exporting reverse-direction rows as hidden phrases.
-    // In this codebase direction is usually "1" (src→tgt), "-1" (tgt→src), "0" (↔).
-    directions = new Set(["1", "0"]),
-    includeTgt = true,
-    dedupe = true,
+    directions = new Set(["0"]),
+    singleTokenOnly = false,
+    minTotal = DEFAULT_FILTER_MIN_TOTAL,
+    confidenceSplit = SURE_TOP_SHARE,
   } = opts;
 
   const phrases = getCachedExtractedPhrases(project_id);
-  if (!phrases) {
-    alert(`No extracted phrases cached for project ${project_id}.\nRun "Extract phrases" first (same session).`);
-    return;
-  }
+  if (!phrases) return { rows: [], pairs: [], rowInfoByKey: new Map(), params: { directions: Array.from(directions), singleTokenOnly, minTotal, confidenceSplit } };
 
-  const base = buildBasePhraseTableForDownloads(phrases, { minTotal: DEFAULT_FILTER_MIN_TOTAL, topK: 10 });
+  const base = buildBasePhraseTableForDownloads(phrases, { minTotal, topK: 10 });
   const sure = filterPhraseTranslationTable(base, (r) =>
-    r.total >= DEFAULT_FILTER_MIN_TOTAL &&
-    r.top_share >= SURE_TOP_SHARE
+    r.total >= minTotal && r.top_share >= confidenceSplit
   );
 
-  const out = [];
-  const seen = new Set();
+  const pairs = [];
+  const rowInfoByKey = new Map();
 
   for (const r of (sure.rows || [])) {
     const dir = String(r.direction ?? "");
@@ -369,25 +782,211 @@ export function downloadSurePhrasesAsHiddenJSON(project_id, opts = {}) {
 
     const src = (r.src || "").trim();
     const tgt = (r.top_tgt || "").trim();
+    if (!src || !tgt) continue;
 
-    if (!src) continue;
+    if (singleTokenOnly && !_isSingleToken(src)) continue;
 
-    const entry = includeTgt ? { src, tgt } : { src };
-
-    if (dedupe) {
-      const key = includeTgt ? `${src}\u0000${tgt}` : src;
-      if (seen.has(key)) continue;
-      seen.add(key);
+    const key = `${src}\u0000${tgt}`;
+    if (!rowInfoByKey.has(key)) {
+      pairs.push({ src, tgt });
+      rowInfoByKey.set(key, {
+        direction: dir,
+        src,
+        tgt,
+        total: r.total,
+        top_share: r.top_share,
+        top_count: r.top_count,
+        num_tgts: r.num_tgts,
+        topk: r.topk || [],
+      });
     }
-
-    out.push(entry);
   }
 
-  const ts = new Date().toISOString().replace(/[:]/g, "-");
-  downloadTextFile(
-    `hidden_phrases_from_sure_project_${project_id}_${ts}.json`,
-    JSON.stringify(out, null, 2)
-  );
+  // sort pairs by total desc (stable)
+  pairs.sort((a, b) => {
+    const ka = `${a.src}\u0000${a.tgt}`;
+    const kb = `${b.src}\u0000${b.tgt}`;
+    return (rowInfoByKey.get(kb)?.total || 0) - (rowInfoByKey.get(ka)?.total || 0);
+  });
+
+  return {
+    rows: sure.rows || [],
+    pairs,
+    rowInfoByKey,
+    params: { directions: Array.from(directions), singleTokenOnly, minTotal, confidenceSplit }
+  };
+}
+
+function buildRobustAndFormHiddenArtifacts(project_id, opts = {}) {
+  const {
+    robustDirections = new Set(["0"]),
+    robustSingleTokenOnly = false,
+    robustMinTotal = DEFAULT_FILTER_MIN_TOTAL,
+    robustConfidenceSplit = SURE_TOP_SHARE,
+    maxExamplesPerGroup = 12,
+  } = opts;
+
+  const phrases = getCachedExtractedPhrases(project_id);
+  if (!phrases) {
+    throw new Error(
+      `No extracted phrases cached for project ${project_id}. Run "Extract phrases" first (same session).`
+    );
+  }
+
+  // --- robust/sure candidates ---
+  const robust = _buildRobustHiddenCandidatesFromCachedPhrases(project_id, {
+    directions: robustDirections,
+    singleTokenOnly: robustSingleTokenOnly,
+    minTotal: robustMinTotal,
+    confidenceSplit: robustConfidenceSplit,
+  });
+
+  const robustSet = new Set(robust.pairs.map(p => `${p.src}\u0000${p.tgt}`));
+
+  // --- form-aligned candidates (from last extraction cache) ---
+  const formCache = getCachedFormAlignedCandidates(project_id);
+  const formPairs = (formCache?.pairs || []).filter(p => p?.src && p?.tgt);
+  const formExamples = formCache?.examples || [];
+  const formParams = formCache?.params || {};
+
+  const formSet = new Set(formPairs.map(p => `${p.src}\u0000${p.tgt}`));
+
+  // --- overlaps ---
+  let both = 0;
+  for (const k of robustSet) if (formSet.has(k)) both++;
+
+  const robustOnly = robustSet.size - both;
+  const formOnly = formSet.size - both;
+  const unionCount = robustSet.size + formSet.size - both;
+
+  // --- union list for upload ---
+  const union = [];
+  const seen = new Set();
+
+  // robust first (sorted by freq)
+  for (const p of robust.pairs) {
+    const k = `${p.src}\u0000${p.tgt}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    union.push({ src: p.src, tgt: p.tgt });
+  }
+  // then form
+  for (const p of formPairs) {
+    const k = `${p.src}\u0000${p.tgt}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    union.push({ src: p.src, tgt: p.tgt });
+  }
+
+  // --- readable report ---
+  const tsHuman = new Date().toISOString();
+  const fmtPct = (x) => `${(x * 100).toFixed(1)}%`;
+
+  const lines = [];
+  lines.push("HIDDEN PHRASES EXPORT (ROBUST + FORM-ALIGNED)");
+  lines.push(`Project: ${project_id}`);
+  lines.push(`Generated: ${tsHuman}`);
+  lines.push("");
+
+  lines.push("WHAT THIS IS:");
+  lines.push("- Report for hidden-phrase selection (robust + form-aligned).");
+  lines.push("");
+
+  lines.push("ROBUST/SURE RULE:");
+  lines.push(`- confidence = top_share = top_count / total`);
+  lines.push(`- robust if total >= ${robustMinTotal} AND confidence >= ${robustConfidenceSplit}`);
+  lines.push(`- directions used: ${JSON.stringify(Array.from(robustDirections))}`);
+  lines.push(`- single-token only: ${robustSingleTokenOnly}`);
+  lines.push("");
+
+  lines.push("FORM-ALIGNMENT RULE:");
+  lines.push("- only single-token source forms");
+  lines.push("- Italian head token extraction is conservative (det+head, elision l'/un' etc.)");
+  lines.push("- Ladin tag (formario_lavb.csv) matched against Italian Morph-it features (morphit_it.txt)");
+  lines.push(`- params: ${JSON.stringify(formParams, null, 2)}`);
+  lines.push("");
+
+  lines.push("COUNTS:");
+  lines.push(`- robust total: ${robustSet.size.toLocaleString()}`);
+  lines.push(`- form-aligned total: ${formSet.size.toLocaleString()}`);
+  lines.push(`- BOTH (robust ∩ form-aligned): ${both.toLocaleString()}`);
+  lines.push(`- robust only: ${robustOnly.toLocaleString()}`);
+  lines.push(`- form-aligned only: ${formOnly.toLocaleString()}`);
+  lines.push(`- UNION (hidden phrases JSON size): ${unionCount.toLocaleString()}`);
+  lines.push("");
+
+  const pushRobustExample = (k, label) => {
+    const info = robust.rowInfoByKey.get(k);
+    if (!info) return;
+    const topList = (info.topk || []).slice(0, 6).map(x => `${x.tgt}(${x.count})`).join(", ");
+    lines.push(
+      `[${label}] ${info.src} → ${info.tgt} | conf=${fmtPct(info.top_share)} (${info.top_count}/${info.total}), variants=${info.num_tgts}` +
+      (topList ? ` | top: ${topList}` : "")
+    );
+  };
+
+  lines.push("EXAMPLES — ROBUST ONLY:");
+  {
+    let n = 0;
+    for (const p of robust.pairs) {
+      if (n >= maxExamplesPerGroup) break;
+      const k = `${p.src}\u0000${p.tgt}`;
+      if (formSet.has(k)) continue;
+      pushRobustExample(k, "ROBUST-ONLY");
+      n++;
+    }
+    if (n === 0) lines.push("(none)");
+  }
+  lines.push("");
+
+  lines.push("EXAMPLES — FORM-ALIGNED ONLY:");
+  {
+    let n = 0;
+    for (const ex of formExamples) {
+      if (n >= maxExamplesPerGroup) break;
+      const k = `${(ex.src || "").trim()}\u0000${(ex.tgt || "").trim()}`;
+      if (robustSet.has(k)) continue;
+      lines.push(`[FORM-ONLY] ${ex.src} → ${ex.tgt} (head: ${ex.tgt_head})   [${ex.ladin_tag}] ⇄ [${ex.italian_feat}]`);
+      n++;
+    }
+    if (n === 0) lines.push("(none — run Extract phrases in this session to populate form examples)");
+  }
+  lines.push("");
+
+  lines.push("EXAMPLES — BOTH (ROBUST ∩ FORM-ALIGNED):");
+  {
+    // Only show BOTH examples if we have the morph witness in cached examples
+    const morphByKey = new Map();
+    for (const ex of formExamples) {
+      const k = `${(ex.src || "").trim()}\u0000${(ex.tgt || "").trim()}`;
+      if (!morphByKey.has(k)) morphByKey.set(k, ex);
+    }
+
+    let n = 0;
+    for (const p of robust.pairs) {
+      if (n >= maxExamplesPerGroup) break;
+
+      const k = `${p.src}\u0000${p.tgt}`;
+      if (!formSet.has(k)) continue;        // must be overlap
+      const ex = morphByKey.get(k);
+      if (!ex) continue;                     // only if morph witness exists
+
+      // robust line
+      pushRobustExample(k, "BOTH");
+      // morph witness line
+      lines.push(`          morph: head=${ex.tgt_head}   [${ex.ladin_tag}] ⇄ [${ex.italian_feat}]`);
+
+      n++;
+    }
+
+    if (n === 0) lines.push("(none)");
+  }
+  lines.push("");
+
+  return {
+    union,
+    reportText: lines.join("\n"),
+  };
 }
 
 export function downloadDubiousPhraseTableJSON(project_id) {
@@ -409,32 +1008,31 @@ export function downloadDubiousPhraseTableJSON(project_id) {
 
 // --- Robustness report cache keys (stored in localStorage) ---
 const ROBUSTNESS_CACHE_KEY_TEXT = (projectId) =>
-  `alignfix:robustness_report_text:${projectId}`;
+  `alignfix:v2:robustness_report_text:${projectId}`;
 const ROBUSTNESS_CACHE_KEY_JSON = (projectId) =>
-  `alignfix:robustness_report_json:${projectId}`;
+  `alignfix:v2:robustness_report_json:${projectId}`;
 
-function cacheRobustnessReport(projectId, phrasesArray) {
+function cacheRobustnessReport(projectId, phrasesArray, extra = {}) {
   try {
     const report = buildTranslationRobustnessReport(phrasesArray, {
+      directions: new Set(["0"]),
       singleWordOnly: true,
-      minTotal: 30,
-      robustTopShare: 0.85,
-      nonRobustTopShare: 0.60,
+      minTotal: DEFAULT_FILTER_MIN_TOTAL,   // 10
+      confidenceSplit: SURE_TOP_SHARE,      // 0.75
       maxExamples: 25,
       maxAlternativesShown: 6,
     });
+
+    report.extra = { ...(extra || {}) };
 
     const text = robustnessReportToText(report);
 
     localStorage.setItem(ROBUSTNESS_CACHE_KEY_JSON(projectId), JSON.stringify(report));
     localStorage.setItem(ROBUSTNESS_CACHE_KEY_TEXT(projectId), text);
 
-    console.log(
-      `✅ Robustness report cached for project ${projectId}. ` +
-      `Use "Download Robustness Report" in the Project tab to export it.`
-    );
+    console.log(`✅ Translation overview cached for project ${projectId}.`);
   } catch (e) {
-    console.warn("⚠️ Robustness report generation/caching failed:", e);
+    console.warn("⚠️ Overview report generation/caching failed:", e);
   }
 }
 
@@ -449,7 +1047,7 @@ export function downloadRobustnessReport(projectId) {
     return;
   }
   const ts = new Date().toISOString().replace(/[:]/g, "-");
-  downloadTextFile(`robustness_report_project_${projectId}_${ts}.txt`, text);
+  downloadTextFile(`translation_overview_project_${projectId}_${ts}.txt`, text);
 }
 
 function downloadTextFile(filename, text) {
@@ -466,31 +1064,22 @@ function downloadTextFile(filename, text) {
 
 function buildTranslationRobustnessReport(phrasesArray, opts = {}) {
   const {
-    // Start simple: only analyze single-word sources
+    directions = new Set(["0"]),
     singleWordOnly = true,
-
-    // Ignore rare words so the stats mean something
-    minTotal = 30,
-
-    // "Robust": top translation dominates
-    robustTopShare = 0.85,
-
-    // "Non-robust": lots of competition
-    nonRobustTopShare = 0.60,
-
-    // How many examples to include
+    minTotal = DEFAULT_FILTER_MIN_TOTAL, // 10
+    confidenceSplit = SURE_TOP_SHARE,    // 0.75
     maxExamples = 25,
-
-    // How many alternative translations to show per source
     maxAlternativesShown = 6,
   } = opts;
 
   const isSingleWord = (s) => !/\s/.test((s || "").trim());
 
-  // src -> (tgt -> count)
   const src2tgt = new Map();
 
   for (const p of phrasesArray || []) {
+    const dir = String(p.direction ?? "0");
+    if (directions && !directions.has(dir)) continue;
+
     const src = (p.src_phrase || "").trim();
     const tgt = (p.tgt_phrase || "").trim();
     const c = Number(p.num_occurrences || 0);
@@ -506,83 +1095,116 @@ function buildTranslationRobustnessReport(phrasesArray, opts = {}) {
     m.set(tgt, (m.get(tgt) || 0) + c);
   }
 
-  const robust = [];
-  const nonRobust = [];
+  const sure = [];
+  const dubious = [];
+
+  let belowMinTotal = 0;
 
   for (const [src, tgtMap] of src2tgt.entries()) {
     const entries = Array.from(tgtMap.entries()).sort((a, b) => b[1] - a[1]);
-    if (entries.length === 0) continue;
+    if (!entries.length) continue;
 
     const total = entries.reduce((acc, [, c]) => acc + c, 0);
-    if (total < minTotal) continue;
+    if (total < minTotal) {
+      belowMinTotal++;
+      continue;
+    }
 
     const [topTgt, topCount] = entries[0];
-    const topShare = topCount / total;
+    const topShare = total ? (topCount / total) : 0;
 
     const record = {
       src,
       topTgt,
       topCount,
-      topShare,
+      topShare,  // confidence
       total,
       numTranslations: entries.length,
-      alternatives: entries.slice(1, 1 + maxAlternativesShown), // [ [tgt, count], ... ]
-      topAll: entries.slice(0, maxAlternativesShown),            // include top list for non-robust
+      topAll: entries.slice(0, maxAlternativesShown),
+      alternatives: entries.slice(1, 1 + maxAlternativesShown),
     };
 
-    if (topShare >= robustTopShare) {
-      robust.push(record);
-    } else if (entries.length >= 2 && topShare <= nonRobustTopShare) {
-      nonRobust.push(record);
-    }
+    if (topShare >= confidenceSplit) sure.push(record);
+    else dubious.push(record);
   }
 
-  robust.sort((a, b) => b.total - a.total);
-  nonRobust.sort((a, b) => b.total - a.total);
+  sure.sort((a, b) => b.total - a.total);
+  dubious.sort((a, b) => b.total - a.total);
+
+  const classifiedTotal = sure.length + dubious.length;
 
   return {
-    params: { singleWordOnly, minTotal, robustTopShare, nonRobustTopShare, maxExamples, maxAlternativesShown },
-    counts: {
-      candidates: src2tgt.size,
-      robust_found: robust.length,
-      nonrobust_found: nonRobust.length,
+    params: {
+      directions: Array.from(directions || []),
+      singleWordOnly,
+      minTotal,
+      confidenceSplit,
+      maxExamples,
+      maxAlternativesShown,
     },
-    robust_examples: robust.slice(0, maxExamples),
-    nonrobust_examples: nonRobust.slice(0, maxExamples),
+    counts: {
+      unique_src_considered: src2tgt.size,
+      below_minTotal: belowMinTotal,
+      classified_total: classifiedTotal,
+      sure_found: sure.length,
+      dubious_found: dubious.length,
+    },
+    sure_examples: sure.slice(0, maxExamples),
+    dubious_examples: dubious.slice(0, maxExamples),
   };
 }
 
 function robustnessReportToText(report) {
   const fmtPct = (x) => `${(x * 100).toFixed(1)}%`;
+  const extra = report.extra || {};
+  const split = report.params?.confidenceSplit ?? 0.75;
 
   const lines = [];
-  lines.push("TRANSLATION ROBUSTNESS REPORT");
+  lines.push("TRANSLATION CONFIDENCE OVERVIEW");
   lines.push("");
+  lines.push("DEFINITION:");
+  lines.push(`- confidence = top_share (share of the most frequent translation)`);
+  lines.push(`- sure/robust if confidence >= ${split}`);
+  lines.push(`- dubious if confidence < ${split}`);
+  lines.push("");
+
   lines.push("PARAMS:");
   lines.push(JSON.stringify(report.params, null, 2));
   lines.push("");
+
   lines.push("COUNTS:");
   lines.push(JSON.stringify(report.counts, null, 2));
   lines.push("");
-  lines.push("✅ ROBUST EXAMPLES (top translation dominates):");
+
+  lines.push("FORM-ALIGNED CANDIDATES (THIS RUN):");
+  lines.push(`- Candidates due to form alignment (downloadable): ${(extra.form_aligned_candidates ?? 0).toLocaleString()}`);
   lines.push("");
 
-  for (const r of report.robust_examples) {
-    const alts = r.alternatives.map(([t, c]) => `${t} (${c})`).join(", ");
+  if (Array.isArray(extra.form_aligned_examples) && extra.form_aligned_examples.length) {
+    lines.push("FORM-ALIGNMENT EXAMPLES (Ladin tag matched Italian Morph-it feature):");
+    for (const ex of extra.form_aligned_examples) {
+      lines.push(`- ${ex.src} → ${ex.tgt} (head: ${ex.tgt_head})   [${ex.ladin_tag}] ⇄ [${ex.italian_feat}]`);
+    }
+    lines.push("");
+  }
+
+  lines.push("✅ SURE/ROBUST EXAMPLES:");
+  lines.push("");
+  for (const r of report.sure_examples || []) {
+    const tops = (r.topAll || []).map(([t, c]) => `${t} (${c})`).join(", ");
     lines.push(
-      `[ROBUST] ${r.src} → ${r.topTgt} | top=${fmtPct(r.topShare)} (${r.topCount}/${r.total}), variants=${r.numTranslations}` +
-      (alts ? ` | alts: ${alts}` : "")
+      `[SURE] ${r.src} → ${r.topTgt} | conf=${fmtPct(r.topShare)} (${r.topCount}/${r.total}), variants=${r.numTranslations}` +
+      (tops ? ` | top list: ${tops}` : "")
     );
   }
 
   lines.push("");
-  lines.push("⚠️ NON-ROBUST EXAMPLES (competing translations):");
+  lines.push("⚠️ DUBIOUS EXAMPLES:");
   lines.push("");
-
-  for (const r of report.nonrobust_examples) {
-    const tops = r.topAll.map(([t, c]) => `${t} (${c})`).join(", ");
+  for (const r of report.dubious_examples || []) {
+    const tops = (r.topAll || []).map(([t, c]) => `${t} (${c})`).join(", ");
     lines.push(
-      `[NON-ROBUST] ${r.src} | top=${r.topTgt} ${fmtPct(r.topShare)} (${r.topCount}/${r.total}), variants=${r.numTranslations}` +
+      `[DUBIOUS] ${r.src} | top=${r.topTgt} conf=${fmtPct(r.topShare)} (${r.topCount}/${r.total}), variants=${r.numTranslations}` +
       (tops ? ` | top list: ${tops}` : "")
     );
   }
@@ -1099,9 +1721,6 @@ export async function extractPhrases(project_id) {
     );
     
     cacheExtractedPhrases(project_id, phrases);
-
-    // --- Build + cache robustness report (download happens via a dedicated button) ---
-    cacheRobustnessReport(project_id, phrases);
     
     try {
         pyodide.globals.set("project_id", project_id);
@@ -1126,11 +1745,34 @@ export async function extractPhrases(project_id) {
         }
         const endSaveTime = performance.now();
         console.log(`⏱️ Phrases saved in ${(endSaveTime - startSaveTime) / 1000} seconds`);
+        
+        // --- Form-aligned candidates (DO NOT auto-hide; just compute + cache for download) ---
+        try {
+          const morphRes = await _autoAddMorphHiddenPhrases(project_id, phrases, pyodide, {
+            allowedDirections: new Set(["0"]),
+            singleTokenOnly: true,
+            maxExamplePairs: 20,
+            doImport: false, // ✅ important
+          });
 
-        // add to stats duration of delete and save
-        stats_obj.db_delete_duration_seconds = (endDeleteTime - startDeleteTime) / 1000;
-        stats_obj.db_insert_duration_seconds = (endSaveTime - startSaveTime) / 1000;
-        console.log('progress:100');
+          cacheFormAlignedCandidates(project_id, {
+            pairs: morphRes.pairs,
+            examples: morphRes.examples,
+            params: morphRes.params
+          });
+
+          stats_obj.form_aligned_candidates = morphRes.found;
+          stats_obj.form_aligned_examples = morphRes.examples;
+
+          console.log(`ℹ️ Form-aligned candidates (not hidden automatically): ${morphRes.found.toLocaleString()}`);
+        } catch (e) {
+          console.warn("⚠️ Morph form-alignment scan failed (continuing):", e);
+        }
+
+        cacheRobustnessReport(project_id, phrases, {
+          form_aligned_candidates: stats_obj.form_aligned_candidates ?? 0,
+          form_aligned_examples: stats_obj.form_aligned_examples ?? [],
+        });
 
     } catch (err) {
         console.error('❌ Critical error during phrase processing:', err.message || err);
@@ -1370,5 +2012,22 @@ export async function downloadPhrases(project_id) {
   }
 
 }
+
+export function downloadPhrasesExcludingReport(project_id) {
+  const { reportText } = buildRobustAndFormHiddenArtifacts(project_id, {
+    robustDirections: new Set(["0"]),
+    robustSingleTokenOnly: false,
+    robustMinTotal: DEFAULT_FILTER_MIN_TOTAL,
+    robustConfidenceSplit: SURE_TOP_SHARE,
+    maxExamplesPerGroup: 12,
+  });
+
+  const ts = new Date().toISOString().replace(/[:]/g, "-");
+  downloadTextFile(
+    `phrases_excluding_report_robust+form_project_${project_id}_${ts}.txt`,
+    reportText
+  );
+}
+
 
 

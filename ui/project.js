@@ -30,7 +30,8 @@ import {
   downloadDubiousPhraseTableCSV,
   downloadSurePhraseTableJSON,
   downloadDubiousPhraseTableJSON,
-  downloadSurePhrasesAsHiddenJSON
+  downloadSurePhrasesAsHiddenJSON,
+  downloadPhrasesExcludingReport
 } from "../backend/js/phrases.js";
 import { fetchTranslations, storeTranslation, deleteTranslation } from "../backend/js/alignments.js";
 import { applyFixes } from "../backend/js/fixes.js";
@@ -106,8 +107,8 @@ export async function renderProject(id) {
         <button id="download-phrases-btn" class="btn btn-sm btn-secondary">
           <i class="fas fa-download"></i> Download Phrases
         </button>
-        <button id="download-robustness-btn" class="btn btn-outline-secondary btn-sm">
-          Download Robustness Report
+        <button id="download-excluding-btn" class="btn btn-outline-secondary btn-sm">
+          Download Excluding Report
         </button>
         <button id="download-phrase-table-csv-btn" class="btn btn-outline-secondary btn-sm">
           Download Phrase Table (CSV)
@@ -373,9 +374,9 @@ export async function renderProject(id) {
   });
 
   // NOTE: don't use bindAsyncButton here (it awaits nextFrame and can break downloads)
-  const rb = document.getElementById("download-robustness-btn");
+  const rb = document.getElementById("download-excluding-btn");
   if (rb) {
-    rb.addEventListener("click", () => downloadRobustnessReport(id));
+    rb.addEventListener("click", () => downloadPhrasesExcludingReport(id));
   }
 
   // Downloads should be direct click handlers (no bindAsyncButton), so browsers allow them reliably.

@@ -13,80 +13,106 @@
 
 ## Phrase Confidence Reports
 
-After phrase extraction, AlignFix analyzes how consistently each source
-phrase is translated.
+After phrase extraction, AlignFix analyzes how consistently each source phrase is translated.
 
-For every source phrase, we count:
+For every source phrase (optionally per direction), we count:
 
--   how often it appears in total
--   how often each target translation appears
+- how often it appears in total (`total`)
+- how often each target translation appears
 
 From this we compute a simple confidence score:
 
-confidence = (most frequent translation count) / (total occurrences)
+`confidence = top_share = (most frequent translation count) / (total occurrences)`
 
 The confidence value is between 0 and 1:
 
--   1.0 → always translated the same way
--   0.5 → two translations used equally often
+- `1.0` → always translated the same way
+- `0.5` → two translations used equally often
 
-------------------------------------------------------------------------
+### Sure / Robust Phrases
 
-Sure Phrases
+A phrase is marked **Sure / Robust** if:
 
-A phrase is marked Sure if:
+- it appears at least `minTotal` times (default: `10`)
+- its confidence is `>= confidenceSplit` (default: `0.75`)
 
--   it appears at least 10 times
--   its confidence is ≥ 0.90
+Interpretation: the translation is consistent in the corpus.
 
-This means that at least 90% of the time it is translated the same way.
+### Dubious Phrases
 
-Interpretation: The translation is highly consistent in the corpus.
+A phrase is marked **Dubious** if:
 
-------------------------------------------------------------------------
+- it appears at least `minTotal` times (default: `10`)
+- its confidence is `< confidenceSplit` (default: `0.75`)
 
-Dubious Phrases
+Interpretation: the phrase is translated less consistently and may need review.
 
-A phrase is marked Dubious if:
+> Note: we do **not** require “at least 2 different target translations” explicitly — low confidence already implies variation in practice.
 
--   it appears at least 10 times
--   it has at least 2 different target translations
--   its confidence is ≤ 0.60
+---
 
-This means the most common translation accounts for at most 60% of
-occurrences.
+## Form-Aligned Candidates (Morphology)
 
-Interpretation: The phrase is translated inconsistently and may need
-review.
+In addition to confidence-based robustness, AlignFix computes **form-aligned candidates** (not automatically hidden):
 
-------------------------------------------------------------------------
+- only **single-token** source forms are considered
+- Ladin morphology is taken from `backend/local_data/formario_lavb.csv`
+- Italian morphology is taken from `backend/local_data/morphit_it.txt` (Morph-it)
+- the Italian **head token** is extracted conservatively (det+head, elisions like `l'`, etc.)
+- a pair is considered *form-aligned* if Ladin tag features match a compatible Morph-it feature for the Italian head
 
-AlignFix generates the following report files after phrase extraction:
+These candidates are used in the **Hidden phrases** workflow described below.
 
-- Phrase Table (CSV / JSON)
-Complete table of all extracted phrases with statistics and confidence scores.
+---
 
-- Sure Phrases (CSV / JSON)
-High-confidence phrases (consistent translations).
+## Generated Files After Phrase Extraction
 
-- Dubious Phrases (CSV / JSON)
-Low-confidence phrases (inconsistent translations).
+AlignFix can generate/download the following outputs:
 
-- Robustness Report (TXT)
-Summary overview with example “robust” and “non-robust” phrases.
+- **Phrase Table (CSV / JSON)**  
+  Complete table of extracted phrases with statistics and confidence scores.
 
-What the Exported Files Contain
+- **Sure / Robust Phrases (CSV / JSON)**  
+  High-confidence phrases (consistent translations).
 
-The CSV/JSON reports include:
+- **Dubious Phrases (CSV / JSON)**  
+  Low-confidence phrases (inconsistent translations).
 
--   total — total number of occurrences
--   top_tgt — most frequent translation
--   top_count — number of times the most frequent translation occurs
--   top_share — confidence score
--   num_tgts — number of distinct translations
--   entropy — how variable the translations are
+- **Translation Confidence Overview (TXT)**  
+  Overview summary with example “sure/robust” and “dubious” phrases, plus
+  form-aligned candidate counts and examples from the last extraction.
 
-The top_share value is the confidence used for classification.
+---
+
+## Hidden Phrases Export (Robust + Form-Aligned)
+
+AlignFix supports exporting a **Hidden phrases JSON** (uploadable) built as the union:
+
+`HIDDEN = ROBUST ∪ FORM-ALIGNED`
+
+- **ROBUST** is derived from confidence (`minTotal`, `confidenceSplit`)
+- **FORM-ALIGNED** is derived from morphology matching (single-token only)
+- A separate **report (TXT)** explains:
+  - how many are robust-only, form-only, and **both**
+  - examples for each category (including “both” with morph witnesses)
+
+Depending on the UI wiring, the “report-only” download and the “hidden phrases JSON” download may be separate buttons.
+
+---
+
+## What the CSV/JSON Reports Contain
+
+The phrase tables include:
+
+- `total` — total number of occurrences
+- `top_tgt` — most frequent translation
+- `top_count` — number of times the most frequent translation occurs
+- `top_share` — confidence score (`top_count / total`)
+- `num_tgts` — number of distinct translations
+- `entropy` — how variable the translations are
+- `topk` — list of top target alternatives with counts
+
+The `top_share` value is the confidence used for classification.
 
 ## 🌟 Key Features
 
