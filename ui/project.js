@@ -16,10 +16,11 @@
 
 import {
   extractPhrases,
-  fetchPhrases,
+  fetchPhraseOverview,
   fetchIgnoredPhrases,
   setIgnorePhrase,
   importIgnoredFromFile,
+  ignorePhrasePair,
   downloadIgnoredPhrases,
   downloadPhrases,
   deleteAllIgnoredPhrases,
@@ -64,6 +65,149 @@ function escapeForHtmlAttr(str) {
     .replace(/\r?\n/g, '\\n');
 }
 
+function formatPct(val) {
+  const num = Number(val);
+  return Number.isFinite(num) ? `${(num * 100).toFixed(1)}%` : '—';
+}
+
+function normalizePhraseDisplay(text) {
+  if (text == null) return '';
+  return String(text)
+    .replace(/\s*#NB\s*/g, '')
+    .replace(/\s*(["'’`])\s*/g, '$1')
+    .replace(/\s+([,.;:!?%\]\)])/g, '$1')
+    .replace(/([\[\(¿¡«])\s+/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeVisibleHtml(html) {
+  if (html == null) return '';
+  return String(html)
+    .replace(/\s*#NB\s*/g, '')
+    .replace(/\s*(["'’`])\s*/g, '$1')
+    .replace(/\s+([,.;:!?%\]\)])/g, '$1')
+    .replace(/([\[\(¿¡«])\s+/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function renderVariantPanel(row) {
+  const topk = Array.isArray(row.topk) ? row.topk : [];
+  const variantsShown = topk.length;
+  const totalVariants = Number.isFinite(Number(row.num_tgts)) ? Number(row.num_tgts) : variantsShown;
+  const srcPretty = normalizePhraseDisplay(row.src_phrase);
+
+  if (!variantsShown || totalVariants <= 1) {
+    return `<span>variants: <strong>${totalVariants || 1}</strong></span>`;
+  }
+
+  const variantButtons = topk.map((variant, idx) => {
+    const tgt = String(variant?.tgt || '').trim();
+    const tgtPretty = normalizePhraseDisplay(tgt);
+    const count = Number(variant?.count || 0);
+    const share = formatPct(variant?.share || 0);
+    const btnClass = idx === 0 ? 'btn-outline-primary' : 'btn-outline-secondary';
+
+    return `<button
+      type="button"
+      class="btn btn-sm ${btnClass} show-variant-btn"
+      data-src="${escapeForHtmlAttr(row.src_phrase)}"
+      data-tgt="${escapeForHtmlAttr(tgt)}"
+      data-direction="${escapeForHtmlAttr(row.direction)}"
+      title="Show sentence pairs for ${escapeForHtmlAttr(srcPretty)} ${getDirectionSymbol(row.direction)} ${escapeForHtmlAttr(tgtPretty)}"
+    >${escapeForHtmlAttr(tgtPretty)} <span class="text-muted">(${count}, ${share})</span></button>`;
+  }).join(' ');
+
+  const moreCount = Math.max(0, totalVariants - variantsShown);
+  const moreLine = moreCount > 0
+    ? `<div class="small text-muted mt-2">+ ${moreCount} more variant${moreCount === 1 ? '' : 's'} not shown here.</div>`
+    : '';
+
+  return `
+    <button type="button" class="btn btn-sm btn-link p-0 align-baseline toggle-variants-btn text-decoration-none">
+      <span class="text-body-secondary">variants:</span> <strong>${totalVariants}</strong>
+    </button>
+    <div class="variant-list-panel d-none mt-2 border rounded p-2 bg-light-subtle">
+      <div class="small fw-semibold mb-2">Variants for <span class="text-body">${escapeForHtmlAttr(srcPretty)}</span></div>
+      <div class="d-flex flex-wrap gap-2">${variantButtons}</div>
+      <div class="small text-muted mt-2">Click a variant to load the matching sentence pairs on the right.</div>
+      ${moreLine}
+    </div>
+  `;
+}
+
+function renderSuspicionSummary(row) {
+  if (!row?.suspicious) return '';
+
+  const reasons = Array.isArray(row.suspicious_reasons) ? row.suspicious_reasons.filter(Boolean) : [];
+  const reasonsText = reasons.join(' · ');
+
+  return `
+    <div class="small mt-1">
+      <span class="badge text-bg-warning" title="${escapeForHtmlAttr(reasonsText)}">
+        <i class="fas fa-triangle-exclamation me-1"></i>Suspicious
+      </span>
+    </div>
+  `;
+}
+
+function renderPhraseOverviewCell(row) {
+  const confPct = formatPct(row.top_share);
+  const variantsHtml = renderVariantPanel(row);
+  const srcPretty = normalizePhraseDisplay(row.src_phrase);
+  const tgtPretty = normalizePhraseDisplay(row.tgt_phrase);
+  const suspicionHtml = renderSuspicionSummary(row);
+  const pairCount = Number.isFinite(Number(row.top_count)) ? Number(row.top_count) : Number(row.num_occurrences || 0);
+  const totalCount = Number.isFinite(Number(row.num_occurrences)) ? Number(row.num_occurrences) : pairCount;
+
+  return `
+    <div class="phrase-overview-cell">
+      <button
+        class="btn btn-sm btn-outline show-phrases-btn"
+        data-src="${escapeForHtmlAttr(row.src_phrase)}"
+        data-tgt="${escapeForHtmlAttr(row.tgt_phrase)}"
+        data-direction="${row.direction}"
+        title="Show sentence pairs for the top translation (${pairCount} matching sentence pair${pairCount === 1 ? '' : 's'})"
+      >
+        <i class="fas fa-search"></i> ${pairCount}
+      </button>
+      <button class="btn btn-sm btn-clear show-src-phrase-btn" data-text="${escapeForHtmlAttr(row.src_phrase)}">${escapeForHtmlAttr(srcPretty)}</button>${getDirectionSymbol(row.direction)}<button class="btn btn-sm btn-clear search-tgt-phrase-btn" data-text="${escapeForHtmlAttr(row.tgt_phrase)}">${escapeForHtmlAttr(tgtPretty)}</button>
+      <div class="small text-muted mt-1">
+        consistency: <strong>${confPct}</strong> · total: <strong>${totalCount}</strong> · ${variantsHtml}
+      </div>
+      ${suspicionHtml}
+    </div>
+  `;
+}
+
+function closeVariantPanels(exceptPanel = null) {
+  document.querySelectorAll('.variant-list-panel').forEach(panel => {
+    if (panel !== exceptPanel) panel.classList.add('d-none');
+  });
+}
+
+function markActiveVariantButton(activeButton) {
+  document.querySelectorAll('.show-variant-btn').forEach(btn => {
+    btn.classList.remove('btn-primary');
+    if (!btn.classList.contains('btn-outline-primary') && !btn.classList.contains('btn-outline-secondary')) {
+      btn.classList.add('btn-outline-secondary');
+    }
+  });
+
+  if (!activeButton) return;
+  activeButton.classList.remove('btn-outline-primary', 'btn-outline-secondary');
+  activeButton.classList.add('btn-primary');
+}
+
+function debounce(fn, wait = 80) {
+  let timeoutId = null;
+  return (...args) => {
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => fn(...args), wait);
+  };
+}
+
 export async function renderProject(id) {
   const app = document.getElementById("app");
 
@@ -85,7 +229,7 @@ export async function renderProject(id) {
         <i class="fas fa-save"></i> Save
       </button>
       <button id="apply-fixes-btn" class="btn btn-success">
-        <i class="fas fa-sync"></i> Apply Changes
+        <i class="fas fa-wrench"></i> Apply Fixes
       </button>
       <button id="download-btn" class="btn btn-secondary">
         <i class="fas fa-download"></i> Download
@@ -127,9 +271,45 @@ export async function renderProject(id) {
         <button id="download-dubious-phrases-json-btn" class="btn btn-outline-secondary btn-sm">
           Download Dubious Phrases (JSON)
         </button>
-        <button id="download-sure-hidden-btn" class="btn btn-warning btn-sm" title="Export Sure phrases as uploadable Hidden phrases JSON">
-          <i class="fas fa-eye-slash me-1"></i> Download excluding phrases
+        <button id="download-sure-hidden-btn" class="btn btn-warning btn-sm" title="Export selected categories as uploadable Hidden phrases JSON">
+          <i class="fas fa-eye-slash me-1"></i> Download hidden phrases JSON
         </button>
+        <div class="mt-2 border rounded p-2 bg-light-subtle" id="hidden-export-toggles">
+          <div class="small fw-bold mb-1">Overview filters and hidden export</div>
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="toggle-hidden-consistency" checked>
+            <label class="form-check-label" for="toggle-hidden-consistency">Hide consistency-based pairs</label>
+          </div>
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="toggle-hidden-form" checked>
+            <label class="form-check-label" for="toggle-hidden-form">Hide form-aligned pairs</label>
+          </div>
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="toggle-hidden-dictionary" checked>
+            <label class="form-check-label" for="toggle-hidden-dictionary">Hide dictionary pairs</label>
+          </div>
+          <div class="mt-2">
+            <label for="phrase-overview-order" class="form-label form-label-sm mb-1">Order words by</label>
+            <select id="phrase-overview-order" class="form-select form-select-sm">
+              <option value="frequency" selected>Most occurrences</option>
+              <option value="worst_consistency">Worst consistency</option>
+              <option value="suspicious">Most suspicious</option>
+            </select>
+          </div>
+          <div class="form-check form-switch mt-2">
+            <input class="form-check-input" type="checkbox" id="toggle-suspicious-only">
+            <label class="form-check-label" for="toggle-suspicious-only">Show suspicious only</label>
+          </div>
+          <div class="small text-muted mt-1">
+            Suspicious = low consistency, many variants, or very close top alternatives.
+          </div>
+          <button id="refresh-overview-btn" class="btn btn-outline-primary btn-sm mt-2">
+            <i class="fas fa-rotate-right me-1"></i> Refresh overview
+          </button>
+          <div class="form-text mt-2">
+            The word list above updates automatically from the last extracted phrases in this browser session.
+          </div>
+        </div>
       </div>
       <!-- Fixes Preview -->
       <div class="card mt-3 shadow-sm">
@@ -375,7 +555,7 @@ export async function renderProject(id) {
   // NOTE: don't use bindAsyncButton here (it awaits nextFrame and can break downloads)
   const rb = document.getElementById("download-excluding-btn");
   if (rb) {
-    rb.addEventListener("click", () => downloadPhrasesExcludingReport(id));
+    rb.addEventListener("click", () => downloadPhrasesExcludingReport(id, getHiddenExportOptions()));
   }
 
   // Downloads should be direct click handlers (no bindAsyncButton), so browsers allow them reliably.
@@ -398,12 +578,61 @@ export async function renderProject(id) {
   if (dubJsonBtn) dubJsonBtn.addEventListener("click", () => downloadDubiousPhraseTableJSON(id));
 
   const sureHiddenBtn = document.getElementById("download-sure-hidden-btn");
-  if (sureHiddenBtn) sureHiddenBtn.addEventListener("click", () => downloadSurePhrasesAsHiddenJSON(id));
+  if (sureHiddenBtn) sureHiddenBtn.addEventListener("click", () => downloadSurePhrasesAsHiddenJSON(id, getHiddenExportOptions()));
 
   // Initialize Bootstrap tooltips
   const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
   tooltipTriggerList.forEach(function (tooltipTriggerEl) {
     new bootstrap.Tooltip(tooltipTriggerEl);
+  });
+
+  function getHiddenExportOptions() {
+    return {
+      includeConsistency: document.getElementById('toggle-hidden-consistency')?.checked ?? true,
+      includeFormAligned: document.getElementById('toggle-hidden-form')?.checked ?? true,
+      includeDictionary: document.getElementById('toggle-hidden-dictionary')?.checked ?? true,
+      directions: new Set(['0']),
+    };
+  }
+
+  function getPhraseOverviewOptions() {
+    return {
+      hideConsistency: document.getElementById('toggle-hidden-consistency')?.checked ?? true,
+      hideFormAligned: document.getElementById('toggle-hidden-form')?.checked ?? true,
+      hideDictionary: document.getElementById('toggle-hidden-dictionary')?.checked ?? true,
+      suspiciousOnly: document.getElementById('toggle-suspicious-only')?.checked ?? false,
+      sortMode: document.getElementById('phrase-overview-order')?.value || 'frequency',
+      directions: new Set(['0']),
+      minTotal: 1,
+      singleTokenOnly: true,
+    };
+  }
+
+  const refreshOverviewBtn = document.getElementById("refresh-overview-btn");
+  const reloadPhraseOverview = () => {
+    const table = $('#phrases-table').DataTable();
+    if (table) table.ajax.reload(null, true);
+  };
+  const debouncedReloadPhraseOverview = debounce(reloadPhraseOverview, 80);
+
+  if (refreshOverviewBtn) {
+    refreshOverviewBtn.addEventListener("click", () => {
+      reloadPhraseOverview();
+    });
+  }
+
+  [
+    'toggle-hidden-consistency',
+    'toggle-hidden-form',
+    'toggle-hidden-dictionary',
+    'toggle-suspicious-only',
+    'phrase-overview-order'
+  ].forEach(controlId => {
+    const control = document.getElementById(controlId);
+    if (!control) return;
+    control.addEventListener('change', () => {
+      debouncedReloadPhraseOverview();
+    });
   });
 
   function clearSearch() {
@@ -582,8 +811,8 @@ export async function renderProject(id) {
         <div class="translation-row">
           <div contenteditable="true" class="mb-2" 
           style="word-wrap: break-word; white-space: pre-wrap;" 
-          id="translation-src-${row.row_id}">${row.line1}</div>
-          <div contenteditable="true" style="word-wrap: break-word; white-space: pre-wrap;" id="translation-tgt-${row.row_id}">${row.line2}</div>
+          id="translation-src-${row.row_id}">${normalizeVisibleHtml(row.line1)}</div>
+          <div contenteditable="true" style="word-wrap: break-word; white-space: pre-wrap;" id="translation-tgt-${row.row_id}">${normalizeVisibleHtml(row.line2)}</div>
           <div class="btn-group-horizontal ms-2 my-2">
             <button class="store-translation-btn btn btn-sm btn-outline-success" data-id="${row.row_id}">
               <i class="fas fa-save"></i>
@@ -617,32 +846,42 @@ export async function renderProject(id) {
     });
   });
 
-  // Initialize DataTable with POST-based server-side processing
+  // Phrase overview table (client-side overview built from cached extraction results)
   const phrasesTable = $("#phrases-table").DataTable({
-    processing: true,      // show "Processing…" while loading
-    serverSide: true,      // server handles paging/filtering/sorting
-    autoWidth: false,  // let columns take natural width
+    processing: true,
+    serverSide: true,
+    autoWidth: false,
     pageLength: 6,
     scrollY: 400,
     scroller: true,
     lengthChange: false,
     ajax: function (d, callback) {
-      const min_phrase_len = $("#min-phrase-length-input").val();
-      const params = { ...d, project_id: id, min_phrase_len: min_phrase_len };
-      fetchPhrases(params).then(result => callback(result));
+      const params = {
+        ...d,
+        project_id: id,
+        min_phrase_len: $("#min-phrase-length-input").val(),
+        ...getPhraseOverviewOptions(),
+      };
+      fetchPhraseOverview(params).then(result => callback(result));
     },
     columns: [
-        { data: null, render: (data, type, row) => `<button class="btn btn-sm btn-outline show-phrases-btn" data-src="${escapeForHtmlAttr(row.src_phrase)}" data-tgt="${escapeForHtmlAttr(row.tgt_phrase)}" data-direction="${row.direction}"><i class="fas fa-search"></i> ${row.num_occurrences}</button>
-        <button class="btn btn-sm btn-clear show-src-phrase-btn" data-text="${escapeForHtmlAttr(row.src_phrase)}">${row.src_phrase}</button>${getDirectionSymbol(row.direction)}<button class="btn btn-sm btn-clear search-tgt-phrase-btn" data-text="${escapeForHtmlAttr(row.tgt_phrase)}">${row.tgt_phrase}</button>` },
-        { data: null, render: (data, type, row) => `<button class="btn btn-sm btn-outline ignore-phrase-btn" data-id="${row.id}" data-src="${row.src_phrase}" data-tgt="${row.tgt_phrase}"><i class="fas fa-eye-slash"></i></button>` }
+      {
+        data: null,
+        render: (data, type, row) => renderPhraseOverviewCell(row)
+      },
+      {
+        data: null,
+        render: (data, type, row) => `<button class="btn btn-sm btn-outline ignore-phrase-btn" data-src="${escapeForHtmlAttr(row.src_phrase)}" data-tgt="${escapeForHtmlAttr(row.tgt_phrase)}"><i class="fas fa-eye-slash"></i></button>`
+      }
     ]
   });
-  // Attach handlers every time the table draws
+
   phrasesTable.on('draw', () => {
     document.querySelectorAll('.ignore-phrase-btn').forEach(btn => {
-      const phrase_id =  btn.dataset.id;
       btn.addEventListener('click', async () => {
-        await setIgnorePhrase(id, phrase_id, 1);
+        const src = btn.dataset.src;
+        const tgt = btn.dataset.tgt;
+        await ignorePhrasePair(id, src, tgt);
         ignoredTable.ajax.reload(null, false);
         phrasesTable.ajax.reload(null, false);
       });
@@ -670,11 +909,29 @@ export async function renderProject(id) {
       });
     });
     document.querySelectorAll('.show-phrases-btn').forEach(btn => {
-      // get data-src, data-tgt, data-direction
       const src = btn.dataset.src;
       const tgt = btn.dataset.tgt;
       const direction = btn.dataset.direction;
       btn.addEventListener('click', () => showTranslations(src, tgt, direction));
+    });
+    document.querySelectorAll('.toggle-variants-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const container = btn.closest('.phrase-overview-cell');
+        const panel = container?.querySelector('.variant-list-panel');
+        if (!panel) return;
+        const willOpen = panel.classList.contains('d-none');
+        closeVariantPanels(willOpen ? panel : null);
+        panel.classList.toggle('d-none', !willOpen);
+      });
+    });
+    document.querySelectorAll('.show-variant-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const src = btn.dataset.src;
+        const tgt = btn.dataset.tgt;
+        const direction = btn.dataset.direction;
+        markActiveVariantButton(btn);
+        showTranslations(src, tgt, direction);
+      });
     });
   });
 
@@ -752,6 +1009,11 @@ function showTranslations(phrase1, phrase2, direction, fix1 = '', fix2 = '') {
 
   // reset to first page
   $('#translations-table').DataTable().page('first').draw('page');
+
+  const translationsEl = document.getElementById('translations-table');
+  if (translationsEl && window.innerWidth < 992) {
+    translationsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
 }
 
 function getPhraseInput() {

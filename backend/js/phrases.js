@@ -20,7 +20,7 @@ import { nextFrame } from "../../ui/utils.js";
 import { getLinesStats } from "./stats.js"; 
 import { safeSyncfs } from "./storage.js";
 
-console.log("phrases.js loaded: v=2026-03-03-TEST");
+console.log("phrases.js loaded: v=2026-03-16-auto-refresh-ui");
 const SAVE_BATCH_SIZE = 100000; // adjust based on memory
 
 // =======================
@@ -40,15 +40,65 @@ function getCachedExtractedPhrases(projectId) {
   return _LAST_EXTRACTED_PHRASES_BY_PROJECT.get(String(projectId)) || null;
 }
 
-// Cache form-aligned candidates from the last extraction (same session only)
+// Cache form-aligned candidates from the last extraction.
+// Also persist them so the report still works after a reload.
 const _LAST_FORM_ALIGNED_BY_PROJECT = new Map(); // projectId -> { pairs: [{src,tgt}], examples: [...], params: {...} }
+const _LAST_DICTIONARY_HIDDEN_BY_PROJECT = new Map(); // projectId -> { pairs: [{src,tgt}], examples: [...], params: {...} }
+const FORM_ALIGNED_CACHE_KEY = (projectId) => `alignfix:v2:form_aligned_candidates:${projectId}`;
+const DICTIONARY_HIDDEN_CACHE_KEY = (projectId) => `alignfix:v2:dictionary_hidden_candidates:${projectId}`;
 
 function cacheFormAlignedCandidates(projectId, data) {
-  _LAST_FORM_ALIGNED_BY_PROJECT.set(String(projectId), data || { pairs: [], examples: [], params: {} });
+  const projectKey = String(projectId);
+  const payload = data || { pairs: [], examples: [], params: {} };
+  _LAST_FORM_ALIGNED_BY_PROJECT.set(projectKey, payload);
+  try {
+    localStorage.setItem(FORM_ALIGNED_CACHE_KEY(projectKey), JSON.stringify(payload));
+  } catch (e) {
+    console.warn("⚠️ Could not persist form-aligned candidates to localStorage:", e);
+  }
 }
 
 function getCachedFormAlignedCandidates(projectId) {
-  return _LAST_FORM_ALIGNED_BY_PROJECT.get(String(projectId)) || null;
+  const projectKey = String(projectId);
+  const mem = _LAST_FORM_ALIGNED_BY_PROJECT.get(projectKey);
+  if (mem) return mem;
+  try {
+    const raw = localStorage.getItem(FORM_ALIGNED_CACHE_KEY(projectKey));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    _LAST_FORM_ALIGNED_BY_PROJECT.set(projectKey, parsed);
+    return parsed;
+  } catch (e) {
+    console.warn("⚠️ Could not restore form-aligned candidates from localStorage:", e);
+    return null;
+  }
+}
+
+function cacheDictionaryHiddenCandidates(projectId, data) {
+  const projectKey = String(projectId);
+  const payload = data || { pairs: [], examples: [], params: {} };
+  _LAST_DICTIONARY_HIDDEN_BY_PROJECT.set(projectKey, payload);
+  try {
+    localStorage.setItem(DICTIONARY_HIDDEN_CACHE_KEY(projectKey), JSON.stringify(payload));
+  } catch (e) {
+    console.warn("⚠️ Could not persist dictionary candidates to localStorage:", e);
+  }
+}
+
+function getCachedDictionaryHiddenCandidates(projectId) {
+  const projectKey = String(projectId);
+  const mem = _LAST_DICTIONARY_HIDDEN_BY_PROJECT.get(projectKey);
+  if (mem) return mem;
+  try {
+    const raw = localStorage.getItem(DICTIONARY_HIDDEN_CACHE_KEY(projectKey));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    _LAST_DICTIONARY_HIDDEN_BY_PROJECT.set(projectKey, parsed);
+    return parsed;
+  } catch (e) {
+    console.warn("⚠️ Could not restore dictionary candidates from localStorage:", e);
+    return null;
+  }
 }
 
 // =======================
@@ -59,6 +109,7 @@ function getCachedFormAlignedCandidates(projectId) {
 
 let _FORMARIO_LAVB_TEXT_PROMISE = null;
 let _MORPHIT_TEXT_PROMISE = null;
+let _LAVB_ITA_TEXT_PROMISE = null;
 
 function _normTok(s) {
   return (s || "").normalize("NFC").trim().toLowerCase();
@@ -190,6 +241,18 @@ async function _loadMorphItTextOnce() {
   return _MORPHIT_TEXT_PROMISE;
 }
 
+
+async function _loadLavbItaTextOnce() {
+  if (!_LAVB_ITA_TEXT_PROMISE) {
+    const url = new URL("../../local_data/lavb-ita.csv", import.meta.url);
+    _LAVB_ITA_TEXT_PROMISE = fetch(url).then(r => {
+      if (!r.ok) throw new Error(`Cannot fetch lavb-ita.csv (${r.status})`);
+      return r.text();
+    });
+  }
+  return _LAVB_ITA_TEXT_PROMISE;
+}
+
 // Build small indexes only for forms we need in THIS extraction (fast + memory-light).
 async function _buildLadinFormIndex(neededSrcFormsSet) {
   const text = await _loadFormarioLavbTextOnce();
@@ -232,6 +295,53 @@ async function _buildMorphItIndex(neededItFormsSet) {
     if (!map.has(key)) map.set(key, []);
     map.get(key).push(feats);
   }
+  return map;
+}
+
+function _parseLavbItaRow(line) {
+  const parts = String(line || "").split(",");
+  if (parts.length < 13) return null;
+
+  const src = (parts[1] || "").trim();
+  const srcTag = (parts[3] || "").trim();
+  const tgtTag = (parts[10] || "").trim();
+  const tgt = (parts[12] || "").trim();
+
+  if (!src || !tgt) return null;
+  return { src, tgt, srcTag, tgtTag };
+}
+
+async function _buildLavbItaIndex(neededSrcFormsSet) {
+  const text = await _loadLavbItaTextOnce();
+  const map = new Map(); // norm(src) -> Map(norm(tgt/head) -> [row...])
+
+  const addEntry = (srcKey, tgtKey, row) => {
+    if (!srcKey || !tgtKey) return;
+    let tgtMap = map.get(srcKey);
+    if (!tgtMap) {
+      tgtMap = new Map();
+      map.set(srcKey, tgtMap);
+    }
+    if (!tgtMap.has(tgtKey)) tgtMap.set(tgtKey, []);
+    tgtMap.get(tgtKey).push(row);
+  };
+
+  for (const line of text.split(/\r?\n/)) {
+    const row = _parseLavbItaRow(line);
+    if (!row) continue;
+
+    const srcKey = _normTok(row.src);
+    if (!neededSrcFormsSet.has(srcKey)) continue;
+
+    const tgtNorm = _normTok(row.tgt);
+    const tgtClean = _cleanItToken(row.tgt);
+    const tgtHead = _extractItalianHeadToken(row.tgt);
+
+    addEntry(srcKey, tgtNorm, row);
+    if (tgtClean && tgtClean !== tgtNorm) addEntry(srcKey, tgtClean, row);
+    if (tgtHead && tgtHead !== tgtNorm && tgtHead !== tgtClean) addEntry(srcKey, tgtHead, row);
+  }
+
   return map;
 }
 
@@ -415,6 +525,94 @@ async function _autoAddMorphHiddenPhrases(project_id, phrasesArray, pyodide, opt
         tgt_head: tgtHead,
         ladin_tag: matchInfo.ladin_tag,
         italian_feat: matchInfo.italian_feat,
+      });
+    }
+
+    if (toIgnore.length >= maxAdded) break;
+  }
+
+  if (!toIgnore.length) {
+    return { found: 0, imported: 0, pairs: [], examples: [], params: { allowedDirections: Array.from(allowedDirections), singleTokenOnly } };
+  }
+
+  if (doImport) {
+    pyodide.globals.set("project_id", project_id);
+    pyodide.globals.set("file_content", JSON.stringify(toIgnore));
+    await pyodide.runPythonAsync(`
+from phrases import import_ignored_from_file
+import_ignored_from_file(project_id, file_content)
+    `);
+    pyodide.globals.delete("file_content");
+  }
+
+  return {
+    found: toIgnore.length,
+    imported: doImport ? toIgnore.length : 0,
+    pairs: toIgnore,
+    examples,
+    params: { allowedDirections: Array.from(allowedDirections), singleTokenOnly, maxAdded, maxExamplePairs, doImport }
+  };
+}
+
+async function _autoAddDictionaryHiddenPhrases(project_id, phrasesArray, pyodide, opts = {}) {
+  const {
+    allowedDirections = new Set(["0"]),
+    singleTokenOnly = true,
+    maxAdded = 200000,
+    maxExamplePairs = 20,
+    doImport = false,
+  } = opts;
+
+  const candidates = [];
+  const neededSrc = new Set();
+
+  for (const p of phrasesArray || []) {
+    const dir = String(p.direction ?? "0");
+    if (allowedDirections && !allowedDirections.has(dir)) continue;
+
+    const src = (p.src_phrase || "").trim();
+    const tgt = (p.tgt_phrase || "").trim();
+    if (!src || !tgt) continue;
+    if (singleTokenOnly && !_isSingleToken(src)) continue;
+
+    const tgtHead = _extractItalianHeadToken(tgt);
+    if (!tgtHead) continue;
+
+    const ns = _normTok(src);
+    const nt = _normTok(tgtHead);
+    neededSrc.add(ns);
+    candidates.push([src, tgt, ns, nt, tgtHead]);
+  }
+
+  if (!candidates.length) {
+    return { found: 0, imported: 0, pairs: [], examples: [], params: { allowedDirections: Array.from(allowedDirections), singleTokenOnly } };
+  }
+
+  const dictIndex = await _buildLavbItaIndex(neededSrc);
+  const toIgnore = [];
+  const seen = new Set();
+  const examples = [];
+
+  for (const [src, tgt, ns, nt, tgtHead] of candidates) {
+    const tgtMap = dictIndex.get(ns);
+    const matches = tgtMap?.get(nt);
+    if (!matches?.length) continue;
+
+    const key = `${src}${tgt}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    toIgnore.push({ src, tgt });
+
+    if (examples.length < maxExamplePairs) {
+      const witness = matches[0];
+      examples.push({
+        src,
+        tgt,
+        tgt_head: tgtHead,
+        dictionary_tgt: witness.tgt,
+        src_tag: witness.srcTag,
+        tgt_tag: witness.tgtTag,
       });
     }
 
@@ -742,22 +940,25 @@ export function downloadSurePhraseTableJSON(project_id) {
 }
 
 export function downloadSurePhrasesAsHiddenJSON(project_id, opts = {}) {
-  const { union } = buildRobustAndFormHiddenArtifacts(project_id, {
-    robustDirections: opts.directions || new Set(["0"]),
-    robustSingleTokenOnly: false,
-    robustMinTotal: DEFAULT_FILTER_MIN_TOTAL,
-    robustConfidenceSplit: SURE_TOP_SHARE,
+  const { union } = buildHiddenPhraseArtifacts(project_id, {
+    includeConsistency: opts.includeConsistency !== false,
+    includeFormAligned: opts.includeFormAligned !== false,
+    includeDictionary: opts.includeDictionary !== false,
+    consistencyDirections: opts.directions || new Set(["0"]),
+    consistencySingleTokenOnly: false,
+    consistencyMinTotal: DEFAULT_FILTER_MIN_TOTAL,
+    consistencyConfidenceSplit: SURE_TOP_SHARE,
     maxExamplesPerGroup: 12,
   });
 
   const ts = new Date().toISOString().replace(/[:]/g, "-");
   downloadTextFile(
-    `hidden_phrases_robust+form_project_${project_id}_${ts}.json`,
+    `hidden_phrases_selection_project_${project_id}_${ts}.json`,
     JSON.stringify(union, null, 2)
   );
 }
 
-function _buildRobustHiddenCandidatesFromCachedPhrases(project_id, opts = {}) {
+function _buildConsistencyHiddenCandidatesFromCachedPhrases(project_id, opts = {}) {
   const {
     directions = new Set(["0"]),
     singleTokenOnly = false,
@@ -768,7 +969,7 @@ function _buildRobustHiddenCandidatesFromCachedPhrases(project_id, opts = {}) {
   const phrases = getCachedExtractedPhrases(project_id);
   if (!phrases) return { rows: [], pairs: [], rowInfoByKey: new Map(), params: { directions: Array.from(directions), singleTokenOnly, minTotal, confidenceSplit } };
 
-  const base = buildBasePhraseTableForDownloads(phrases, { minTotal, topK: 10 });
+  const base = buildBasePhraseTableForDownloads(phrases, { minTotal, topK: 15 });
   const sure = filterPhraseTranslationTable(base, (r) =>
     r.total >= minTotal && r.top_share >= confidenceSplit
   );
@@ -786,7 +987,7 @@ function _buildRobustHiddenCandidatesFromCachedPhrases(project_id, opts = {}) {
 
     if (singleTokenOnly && !_isSingleToken(src)) continue;
 
-    const key = `${src}\u0000${tgt}`;
+    const key = `${src}${tgt}`;
     if (!rowInfoByKey.has(key)) {
       pairs.push({ src, tgt });
       rowInfoByKey.set(key, {
@@ -802,10 +1003,9 @@ function _buildRobustHiddenCandidatesFromCachedPhrases(project_id, opts = {}) {
     }
   }
 
-  // sort pairs by total desc (stable)
   pairs.sort((a, b) => {
-    const ka = `${a.src}\u0000${a.tgt}`;
-    const kb = `${b.src}\u0000${b.tgt}`;
+    const ka = `${a.src}${a.tgt}`;
+    const kb = `${b.src}${b.tgt}`;
     return (rowInfoByKey.get(kb)?.total || 0) - (rowInfoByKey.get(ka)?.total || 0);
   });
 
@@ -817,12 +1017,39 @@ function _buildRobustHiddenCandidatesFromCachedPhrases(project_id, opts = {}) {
   };
 }
 
-function buildRobustAndFormHiddenArtifacts(project_id, opts = {}) {
+const _buildRobustHiddenCandidatesFromCachedPhrases = _buildConsistencyHiddenCandidatesFromCachedPhrases;
+
+function _setFromPairs(pairs) {
+  return new Set((pairs || []).map(p => `${p.src}${p.tgt}`));
+}
+
+function _groupMembership(k, groups) {
+  return groups.filter(g => g.enabled && g.set.has(k)).map(g => g.label);
+}
+
+function _countExactMembership(groups) {
+  const allKeys = new Set();
+  for (const g of groups) {
+    if (!g.enabled) continue;
+    for (const k of g.set) allKeys.add(k);
+  }
+  const out = new Map();
+  for (const k of allKeys) {
+    const sig = _groupMembership(k, groups).sort().join("+");
+    out.set(sig, (out.get(sig) || 0) + 1);
+  }
+  return out;
+}
+
+function buildHiddenPhraseArtifacts(project_id, opts = {}) {
   const {
-    robustDirections = new Set(["0"]),
-    robustSingleTokenOnly = false,
-    robustMinTotal = DEFAULT_FILTER_MIN_TOTAL,
-    robustConfidenceSplit = SURE_TOP_SHARE,
+    includeConsistency = true,
+    includeFormAligned = true,
+    includeDictionary = true,
+    consistencyDirections = new Set(["0"]),
+    consistencySingleTokenOnly = false,
+    consistencyMinTotal = DEFAULT_FILTER_MIN_TOTAL,
+    consistencyConfidenceSplit = SURE_TOP_SHARE,
     maxExamplesPerGroup = 12,
   } = opts;
 
@@ -833,159 +1060,186 @@ function buildRobustAndFormHiddenArtifacts(project_id, opts = {}) {
     );
   }
 
-  // --- robust/sure candidates ---
-  const robust = _buildRobustHiddenCandidatesFromCachedPhrases(project_id, {
-    directions: robustDirections,
-    singleTokenOnly: robustSingleTokenOnly,
-    minTotal: robustMinTotal,
-    confidenceSplit: robustConfidenceSplit,
-  });
+  const consistency = includeConsistency
+    ? _buildConsistencyHiddenCandidatesFromCachedPhrases(project_id, {
+        directions: consistencyDirections,
+        singleTokenOnly: consistencySingleTokenOnly,
+        minTotal: consistencyMinTotal,
+        confidenceSplit: consistencyConfidenceSplit,
+      })
+    : { pairs: [], rowInfoByKey: new Map(), params: {} };
 
-  const robustSet = new Set(robust.pairs.map(p => `${p.src}\u0000${p.tgt}`));
-
-  // --- form-aligned candidates (from last extraction cache) ---
-  const formCache = getCachedFormAlignedCandidates(project_id);
+  const formCache = includeFormAligned ? getCachedFormAlignedCandidates(project_id) : null;
   const formPairs = (formCache?.pairs || []).filter(p => p?.src && p?.tgt);
   const formExamples = formCache?.examples || [];
-  const formParams = formCache?.params || {};
 
-  const formSet = new Set(formPairs.map(p => `${p.src}\u0000${p.tgt}`));
+  const dictCache = includeDictionary ? getCachedDictionaryHiddenCandidates(project_id) : null;
+  const dictPairs = (dictCache?.pairs || []).filter(p => p?.src && p?.tgt);
+  const dictExamples = dictCache?.examples || [];
 
-  // --- overlaps ---
-  let both = 0;
-  for (const k of robustSet) if (formSet.has(k)) both++;
+  const groups = [
+    { key: "consistency", label: "CONSISTENCY", enabled: includeConsistency, set: _setFromPairs(consistency.pairs) },
+    { key: "form", label: "FORM", enabled: includeFormAligned, set: _setFromPairs(formPairs) },
+    { key: "dictionary", label: "DICTIONARY", enabled: includeDictionary, set: _setFromPairs(dictPairs) },
+  ];
 
-  const robustOnly = robustSet.size - both;
-  const formOnly = formSet.size - both;
-  const unionCount = robustSet.size + formSet.size - both;
+  const membershipCounts = _countExactMembership(groups);
+  const consistencySet = groups[0].set;
+  const formSet = groups[1].set;
+  const dictionarySet = groups[2].set;
 
-  // --- union list for upload ---
   const union = [];
   const seen = new Set();
+  const orderedSources = [];
+  if (includeConsistency) orderedSources.push(...consistency.pairs);
+  if (includeFormAligned) orderedSources.push(...formPairs);
+  if (includeDictionary) orderedSources.push(...dictPairs);
 
-  // robust first (sorted by freq)
-  for (const p of robust.pairs) {
-    const k = `${p.src}\u0000${p.tgt}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    union.push({ src: p.src, tgt: p.tgt });
-  }
-  // then form
-  for (const p of formPairs) {
-    const k = `${p.src}\u0000${p.tgt}`;
+  for (const p of orderedSources) {
+    const k = `${p.src}${p.tgt}`;
     if (seen.has(k)) continue;
     seen.add(k);
     union.push({ src: p.src, tgt: p.tgt });
   }
 
-  // --- readable report ---
-  const tsHuman = new Date().toISOString();
   const fmtPct = (x) => `${(x * 100).toFixed(1)}%`;
-
   const lines = [];
-  lines.push("HIDDEN PHRASES EXPORT (ROBUST + FORM-ALIGNED)");
-  lines.push(`Project: ${project_id}`);
-  lines.push(`Generated: ${tsHuman}`);
-  lines.push("");
 
-  lines.push("WHAT THIS IS:");
-  lines.push("- Report for hidden-phrase selection (robust + form-aligned).");
-  lines.push("");
-
-  lines.push("ROBUST/SURE RULE:");
-  lines.push(`- confidence = top_share = top_count / total`);
-  lines.push(`- robust if total >= ${robustMinTotal} AND confidence >= ${robustConfidenceSplit}`);
-  lines.push(`- directions used: ${JSON.stringify(Array.from(robustDirections))}`);
-  lines.push(`- single-token only: ${robustSingleTokenOnly}`);
-  lines.push("");
-
-  lines.push("FORM-ALIGNMENT RULE:");
-  lines.push("- only single-token source forms");
-  lines.push("- Italian head token extraction is conservative (det+head, elision l'/un' etc.)");
-  lines.push("- Ladin tag (formario_lavb.csv) matched against Italian Morph-it features (morphit_it.txt)");
-  lines.push("");
-
-  lines.push("COUNTS:");
-  lines.push(`- robust total: ${robustSet.size.toLocaleString()}`);
-  lines.push(`- form-aligned total: ${formSet.size.toLocaleString()}`);
-  lines.push(`- BOTH (robust ∩ form-aligned): ${both.toLocaleString()}`);
-  lines.push(`- robust only: ${robustOnly.toLocaleString()}`);
-  lines.push(`- form-aligned only: ${formOnly.toLocaleString()}`);
-  lines.push(`- UNION (hidden phrases JSON size): ${unionCount.toLocaleString()}`);
-  lines.push("");
-
-  const pushRobustExample = (k, label) => {
-    const info = robust.rowInfoByKey.get(k);
+  const pushConsistencyExample = (k, label) => {
+    const info = consistency.rowInfoByKey.get(k);
     if (!info) return;
     const topList = (info.topk || []).slice(0, 6).map(x => `${x.tgt}(${x.count})`).join(", ");
     lines.push(
-      `[${label}] ${info.src} → ${info.tgt} | conf=${fmtPct(info.top_share)} (${info.top_count}/${info.total}), variants=${info.num_tgts}` +
+      `${label}: ${info.src} → ${info.tgt} | conf=${fmtPct(info.top_share)} | total=${info.total} | variants=${info.num_tgts}` +
       (topList ? ` | top: ${topList}` : "")
     );
   };
 
-  lines.push("EXAMPLES — ROBUST ONLY:");
-  {
-    let n = 0;
-    for (const p of robust.pairs) {
-      if (n >= maxExamplesPerGroup) break;
-      const k = `${p.src}\u0000${p.tgt}`;
-      if (formSet.has(k)) continue;
-      pushRobustExample(k, "ROBUST-ONLY");
-      n++;
-    }
-    if (n === 0) lines.push("(none)");
-  }
+  const pushSection = (title, emitter) => {
+    lines.push(title);
+    const before = lines.length;
+    emitter();
+    if (lines.length === before) lines.push("(none)");
+    lines.push("");
+  };
+
+  lines.push("HIDDEN PHRASE CANDIDATES");
+  lines.push("");
+  lines.push("COUNTS");
+  lines.push(`- consistency candidates: ${consistencySet.size.toLocaleString()}`);
+  lines.push(`- form-aligned candidates: ${formSet.size.toLocaleString()}`);
+  lines.push(`- dictionary candidates: ${dictionarySet.size.toLocaleString()}`);
+  lines.push(`- consistency only: ${(membershipCounts.get("CONSISTENCY") || 0).toLocaleString()}`);
+  lines.push(`- form only: ${(membershipCounts.get("FORM") || 0).toLocaleString()}`);
+  lines.push(`- dictionary only: ${(membershipCounts.get("DICTIONARY") || 0).toLocaleString()}`);
+  lines.push(`- consistency + form: ${(membershipCounts.get("CONSISTENCY+FORM") || 0).toLocaleString()}`);
+  lines.push(`- consistency + dictionary: ${(membershipCounts.get("CONSISTENCY+DICTIONARY") || 0).toLocaleString()}`);
+  lines.push(`- form + dictionary: ${(membershipCounts.get("FORM+DICTIONARY") || membershipCounts.get("DICTIONARY+FORM") || 0).toLocaleString()}`);
+  lines.push(`- all three: ${(membershipCounts.get("CONSISTENCY+FORM+DICTIONARY") || membershipCounts.get("CONSISTENCY+DICTIONARY+FORM") || 0).toLocaleString()}`);
+  lines.push(`- union size: ${union.length.toLocaleString()}`);
   lines.push("");
 
-  lines.push("EXAMPLES — FORM-ALIGNED ONLY:");
-  {
+  pushSection("CONSISTENCY-ONLY EXAMPLES", () => {
+    let n = 0;
+    for (const p of consistency.pairs) {
+      if (n >= maxExamplesPerGroup) break;
+      const k = `${p.src}${p.tgt}`;
+      const sig = _groupMembership(k, groups).sort().join("+");
+      if (sig !== "CONSISTENCY") continue;
+      pushConsistencyExample(k, `${n + 1}.`);
+      n++;
+    }
+  });
+
+  pushSection("FORM-ALIGNED ONLY EXAMPLES", () => {
     let n = 0;
     for (const ex of formExamples) {
       if (n >= maxExamplesPerGroup) break;
-      const k = `${(ex.src || "").trim()}\u0000${(ex.tgt || "").trim()}`;
-      if (robustSet.has(k)) continue;
-      lines.push(`[FORM-ONLY] ${ex.src} → ${ex.tgt} (head: ${ex.tgt_head})   [${ex.ladin_tag}] ⇄ [${ex.italian_feat}]`);
+      const k = `${(ex.src || "").trim()}${(ex.tgt || "").trim()}`;
+      const sig = _groupMembership(k, groups).sort().join("+");
+      if (sig !== "FORM") continue;
+      lines.push(`${n + 1}. ${ex.src} → ${ex.tgt} | head=${ex.tgt_head} | ${ex.ladin_tag} ⇄ ${ex.italian_feat}`);
       n++;
     }
-    if (n === 0) lines.push("(none — run Extract phrases in this session to populate form examples)");
-  }
-  lines.push("");
+  });
 
-  lines.push("EXAMPLES — BOTH (ROBUST ∩ FORM-ALIGNED):");
-  {
-    // Only show BOTH examples if we have the morph witness in cached examples
-    const morphByKey = new Map();
+  pushSection("DICTIONARY-ONLY EXAMPLES", () => {
+    let n = 0;
+    for (const ex of dictExamples) {
+      if (n >= maxExamplesPerGroup) break;
+      const k = `${(ex.src || "").trim()}${(ex.tgt || "").trim()}`;
+      const sig = _groupMembership(k, groups).sort().join("+");
+      if (sig !== "DICTIONARY") continue;
+      lines.push(`${n + 1}. ${ex.src} → ${ex.tgt} | head=${ex.tgt_head || "?"} | ${ex.src_tag || "?"} ⇄ ${ex.tgt_tag || "?"}`);
+      n++;
+    }
+  });
+
+  pushSection("OVERLAP EXAMPLES", () => {
+    const formByKey = new Map();
     for (const ex of formExamples) {
-      const k = `${(ex.src || "").trim()}\u0000${(ex.tgt || "").trim()}`;
-      if (!morphByKey.has(k)) morphByKey.set(k, ex);
+      const k = `${(ex.src || "").trim()}${(ex.tgt || "").trim()}`;
+      if (!formByKey.has(k)) formByKey.set(k, ex);
+    }
+    const dictByKey = new Map();
+    for (const ex of dictExamples) {
+      const k = `${(ex.src || "").trim()}${(ex.tgt || "").trim()}`;
+      if (!dictByKey.has(k)) dictByKey.set(k, ex);
     }
 
     let n = 0;
-    for (const p of robust.pairs) {
+    for (const p of union) {
       if (n >= maxExamplesPerGroup) break;
+      const k = `${p.src}${p.tgt}`;
+      const labels = _groupMembership(k, groups).sort();
+      if (labels.length < 2) continue;
 
-      const k = `${p.src}\u0000${p.tgt}`;
-      if (!formSet.has(k)) continue;        // must be overlap
-      const ex = morphByKey.get(k);
-      if (!ex) continue;                     // only if morph witness exists
-
-      // robust line
-      pushRobustExample(k, "BOTH");
-      // morph witness line
-      lines.push(`          morph: head=${ex.tgt_head}   [${ex.ladin_tag}] ⇄ [${ex.italian_feat}]`);
-
+      lines.push(`${n + 1}. ${p.src} → ${p.tgt} | ${labels.join(" + ")}`);
+      const info = consistency.rowInfoByKey.get(k);
+      if (info) {
+        const topList = (info.topk || []).slice(0, 6).map(x => `${x.tgt}(${x.count})`).join(", ");
+        lines.push(`   consistency: conf=${fmtPct(info.top_share)} | total=${info.total} | variants=${info.num_tgts}` + (topList ? ` | top: ${topList}` : ""));
+      }
+      const formEx = formByKey.get(k);
+      if (formEx) {
+        lines.push(`   form: head=${formEx.tgt_head} | ${formEx.ladin_tag} ⇄ ${formEx.italian_feat}`);
+      }
+      const dictEx = dictByKey.get(k);
+      if (dictEx) {
+        lines.push(`   dictionary: head=${dictEx.tgt_head || "?"} | ${dictEx.src_tag || "?"} ⇄ ${dictEx.tgt_tag || "?"}`);
+      }
       n++;
     }
+  });
 
-    if (n === 0) lines.push("(none)");
-  }
+  lines.push("PARAMETERS");
+  lines.push(`- include consistency: ${includeConsistency}`);
+  lines.push(`- include form-aligned: ${includeFormAligned}`);
+  lines.push(`- include dictionary: ${includeDictionary}`);
+  lines.push(`- consistency directions: ${JSON.stringify(Array.from(consistencyDirections || []))}`);
+  lines.push(`- consistency single-token only: ${consistencySingleTokenOnly}`);
+  lines.push(`- consistency minimum occurrences: ${consistencyMinTotal}`);
+  lines.push(`- consistency threshold: ${consistencyConfidenceSplit}`);
+  lines.push(`- max examples per section: ${maxExamplesPerGroup}`);
   lines.push("");
 
   return {
     union,
     reportText: lines.join("\n"),
   };
+}
+
+function buildRobustAndFormHiddenArtifacts(project_id, opts = {}) {
+  return buildHiddenPhraseArtifacts(project_id, {
+    includeConsistency: true,
+    includeFormAligned: true,
+    includeDictionary: true,
+    consistencyDirections: opts.robustDirections || new Set(["0"]),
+    consistencySingleTokenOnly: opts.robustSingleTokenOnly || false,
+    consistencyMinTotal: opts.robustMinTotal || DEFAULT_FILTER_MIN_TOTAL,
+    consistencyConfidenceSplit: opts.robustConfidenceSplit || SURE_TOP_SHARE,
+    maxExamplesPerGroup: opts.maxExamplesPerGroup || 12,
+  });
 }
 
 export function downloadDubiousPhraseTableJSON(project_id) {
@@ -1005,15 +1259,18 @@ export function downloadDubiousPhraseTableJSON(project_id) {
   downloadTextFile(`dubious_phrases_project_${project_id}_${ts}.json`, JSON.stringify(dubious, null, 2));
 }
 
-// --- Robustness report cache keys (stored in localStorage) ---
-const ROBUSTNESS_CACHE_KEY_TEXT = (projectId) =>
-  `alignfix:v2:robustness_report_text:${projectId}`;
-const ROBUSTNESS_CACHE_KEY_JSON = (projectId) =>
-  `alignfix:v2:robustness_report_json:${projectId}`;
+// --- Consistency report cache keys (stored in localStorage) ---
+const CONSISTENCY_CACHE_KEY_TEXT = (projectId) =>
+  `alignfix:v2:consistency_report_text:${projectId}`;
+const CONSISTENCY_CACHE_KEY_JSON = (projectId) =>
+  `alignfix:v2:consistency_report_json:${projectId}`;
 
-function cacheRobustnessReport(projectId, phrasesArray, extra = {}) {
+const ROBUSTNESS_CACHE_KEY_TEXT = CONSISTENCY_CACHE_KEY_TEXT;
+const ROBUSTNESS_CACHE_KEY_JSON = CONSISTENCY_CACHE_KEY_JSON;
+
+function cacheConsistencyReport(projectId, phrasesArray, extra = {}) {
   try {
-    const report = buildTranslationRobustnessReport(phrasesArray, {
+    const report = buildTranslationConsistencyReport(phrasesArray, {
       directions: new Set(["0"]),
       singleWordOnly: true,
       minTotal: DEFAULT_FILTER_MIN_TOTAL,   // 10
@@ -1024,30 +1281,33 @@ function cacheRobustnessReport(projectId, phrasesArray, extra = {}) {
 
     report.extra = { ...(extra || {}) };
 
-    const text = robustnessReportToText(report);
+    const text = consistencyReportToText(report);
 
-    localStorage.setItem(ROBUSTNESS_CACHE_KEY_JSON(projectId), JSON.stringify(report));
-    localStorage.setItem(ROBUSTNESS_CACHE_KEY_TEXT(projectId), text);
+    localStorage.setItem(CONSISTENCY_CACHE_KEY_JSON(projectId), JSON.stringify(report));
+    localStorage.setItem(CONSISTENCY_CACHE_KEY_TEXT(projectId), text);
 
-    console.log(`✅ Translation overview cached for project ${projectId}.`);
+    console.log(`✅ Translation consistency overview cached for project ${projectId}.`);
   } catch (e) {
     console.warn("⚠️ Overview report generation/caching failed:", e);
   }
 }
 
 // IMPORTANT: synchronous download (no awaits) so browsers allow it
-export function downloadRobustnessReport(projectId) {
-  const text = localStorage.getItem(ROBUSTNESS_CACHE_KEY_TEXT(projectId));
+export function downloadConsistencyReport(projectId) {
+  const text = localStorage.getItem(CONSISTENCY_CACHE_KEY_TEXT(projectId)) || localStorage.getItem(ROBUSTNESS_CACHE_KEY_TEXT(projectId));
   if (!text) {
     alert(
-      `No robustness report cached for project ${projectId}.\n\n` +
+      `No consistency report cached for project ${projectId}.\n\n` +
       `Run "Extract phrases" first, then try again.`
     );
     return;
   }
   const ts = new Date().toISOString().replace(/[:]/g, "-");
-  downloadTextFile(`translation_overview_project_${projectId}_${ts}.txt`, text);
+  downloadTextFile(`translation_consistency_overview_project_${projectId}_${ts}.txt`, text);
 }
+
+export const downloadRobustnessReport = downloadConsistencyReport;
+
 
 function downloadTextFile(filename, text) {
   const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
@@ -1061,7 +1321,7 @@ function downloadTextFile(filename, text) {
   URL.revokeObjectURL(url);
 }
 
-function buildTranslationRobustnessReport(phrasesArray, opts = {}) {
+function buildTranslationConsistencyReport(phrasesArray, opts = {}) {
   const {
     directions = new Set(["0"]),
     singleWordOnly = true,
@@ -1153,61 +1413,107 @@ function buildTranslationRobustnessReport(phrasesArray, opts = {}) {
   };
 }
 
-function robustnessReportToText(report) {
+function consistencyReportToText(report) {
   const fmtPct = (x) => `${(x * 100).toFixed(1)}%`;
   const extra = report.extra || {};
-  const split = report.params?.confidenceSplit ?? 0.75;
+  const params = report.params || {};
+  const counts = report.counts || {};
+
+  const totalSrc = Number(counts.unique_src_considered ?? 0);
+  const excludedSrc = Number(counts.below_minTotal ?? 0);
+  const classifiedSrc = Number(counts.classified_total ?? 0);
+  const consistentSrc = Number(counts.sure_found ?? 0);
+  const dubiousSrc = Number(counts.dubious_found ?? 0);
+
+  const totalPairs = Number(extra.total_phrase_pairs_extracted ?? 0);
+  const formAligned = Number(extra.form_aligned_candidates ?? 0);
+  const dictionaryAligned = Number(extra.dictionary_candidates ?? 0);
+
+  const worstExamples = [...(report.dubious_examples || [])]
+    .sort((a, b) =>
+      a.topShare - b.topShare ||
+      b.total - a.total ||
+      b.numTranslations - a.numTranslations
+    )
+    .slice(0, params.maxExamples || 15);
+
+  const mostFrequentConsistent = [...(report.sure_examples || [])]
+    .sort((a, b) => b.total - a.total || b.topShare - a.topShare)
+    .slice(0, params.maxExamples || 15);
+
+  const topList = (items) =>
+    (items || []).slice(0, params.maxAlternativesShown || 6)
+      .map(([tgt, count]) => `${tgt}(${count})`)
+      .join(", ");
 
   const lines = [];
-  lines.push("TRANSLATION CONFIDENCE OVERVIEW");
+  lines.push("TRANSLATION CONSISTENCY OVERVIEW");
   lines.push("");
-  lines.push("DEFINITION:");
-  lines.push(`- confidence = top_share (share of the most frequent translation)`);
-  lines.push(`- sure/robust if confidence >= ${split}`);
-  lines.push(`- dubious if confidence < ${split}`);
+  lines.push("OVERVIEW");
+  lines.push(`- source words considered: ${totalSrc.toLocaleString()}`);
+  lines.push(`- classified (>= ${params.minTotal ?? DEFAULT_FILTER_MIN_TOTAL} occurrences): ${classifiedSrc.toLocaleString()}`);
+  lines.push(`- consistent: ${consistentSrc.toLocaleString()}`);
+  lines.push(`- dubious: ${dubiousSrc.toLocaleString()}`);
+  lines.push(`- below minimum occurrences: ${excludedSrc.toLocaleString()}`);
+  lines.push(`- potentially to review: ${(dubiousSrc + excludedSrc).toLocaleString()}`);
+  lines.push(`- extracted phrase pairs: ${totalPairs.toLocaleString()}`);
   lines.push("");
-
-  lines.push("PARAMS:");
-  lines.push(JSON.stringify(report.params, null, 2));
-  lines.push("");
-
-  lines.push("COUNTS:");
-  lines.push(JSON.stringify(report.counts, null, 2));
-  lines.push("");
-
-  const c = report.counts || {};
-  const totalSrc = Number(c.unique_src_considered ?? 0);    // src phrases in scope (after direction+singleWordOnly)
-  const excludedSrc = Number(c.below_minTotal ?? 0);        // src phrases excluded (< minTotal)
-  const classifiedSrc = Number(c.classified_total ?? 0);    // src phrases classified (>= minTotal)
-  const sureSrc = Number(c.sure_found ?? 0);
-  const dubiousSrc = Number(c.dubious_found ?? 0);
-
-  const totalPairs = Number(extra.total_phrase_pairs_extracted ?? 0); // phrase pairs (different unit!)
-
-  lines.push("TOTALS (SOURCE PHRASES IN REPORT SCOPE):");
-  lines.push(`- overall considered: ${totalSrc.toLocaleString()}`);
-  lines.push(`- classified (>= minTotal): ${classifiedSrc.toLocaleString()} (sure=${sureSrc.toLocaleString()}, dubious=${dubiousSrc.toLocaleString()})`);
-  lines.push(`- excluded (< minTotal): ${excludedSrc.toLocaleString()}`);
-  lines.push(`- check: classified + excluded = ${ (classifiedSrc + excludedSrc).toLocaleString() }`);
+  lines.push("HIDDEN-PHRASE CANDIDATES");
+  lines.push(`- due to form alignment: ${formAligned.toLocaleString()}`);
+  lines.push(`- due to dictionary: ${dictionaryAligned.toLocaleString()}`);
   lines.push("");
 
-  lines.push("RAW EXTRACTION (PHRASE PAIRS, DIFFERENT UNIT):");
-  lines.push(`- extracted phrase pairs (after extraction filters): ${totalPairs.toLocaleString()}`);
+  lines.push("WORST CONSISTENCY EXAMPLES");
+  if (!worstExamples.length) {
+    lines.push("(none)");
+  } else {
+    worstExamples.forEach((r, idx) => {
+      lines.push(
+        `${idx + 1}. ${r.src} → ${r.topTgt} | conf=${fmtPct(r.topShare)} | total=${r.total} | variants=${r.numTranslations}` +
+        (r.topAll?.length ? ` | top: ${topList(r.topAll)}` : "")
+      );
+    });
+  }
   lines.push("");
 
-  lines.push("MANUAL REVIEW (SOURCE PHRASES):");
-  lines.push(`- dubious (>= minTotal but conf < split): ${dubiousSrc.toLocaleString()}`);
-  lines.push(`- excluded (< minTotal, not classified): ${excludedSrc.toLocaleString()}`);
-  lines.push(`- total potentially to review: ${(dubiousSrc + excludedSrc).toLocaleString()}`);
+  lines.push("MOST FREQUENT CONSISTENT EXAMPLES");
+  if (!mostFrequentConsistent.length) {
+    lines.push("(none)");
+  } else {
+    mostFrequentConsistent.forEach((r, idx) => {
+      lines.push(
+        `${idx + 1}. ${r.src} → ${r.topTgt} | conf=${fmtPct(r.topShare)} | total=${r.total} | variants=${r.numTranslations}` +
+        (r.topAll?.length ? ` | top: ${topList(r.topAll)}` : "")
+      );
+    });
+  }
   lines.push("");
 
+  lines.push("PARAMETERS");
+  lines.push(`- directions: ${JSON.stringify(params.directions || [])}`);
+  lines.push(`- single-word only: ${params.singleWordOnly ?? true}`);
+  lines.push(`- minimum occurrences: ${params.minTotal ?? DEFAULT_FILTER_MIN_TOTAL}`);
+  lines.push(`- consistency threshold: ${params.confidenceSplit ?? SURE_TOP_SHARE}`);
+  lines.push(`- max examples shown: ${params.maxExamples ?? 25}`);
+  lines.push(`- max alternatives shown: ${params.maxAlternativesShown ?? 6}`);
   lines.push("");
+
   return lines.join("\n");
 }
 
 function trimPhrase(phrase) {
   // trim #NB at start and end of phrases
   return phrase.replace(/^#NB\s+/, '').replace(/\s+#NB$/, '');
+}
+
+function _rowCollectionToSet(rows) {
+  if (rows instanceof Set) return new Set(rows);
+  if (Array.isArray(rows)) return new Set(rows);
+  return new Set();
+}
+
+function _rowCollectionSize(rows) {
+  return _rowCollectionToSet(rows).size;
 }
 
 function getOccurrencesFromFile(content, direction) {
@@ -1229,10 +1535,11 @@ function getOccurrencesFromFile(content, direction) {
       if (!occurrences[key]) {
         occurrences[key] = { 
           direction: direction, 
-          rows: []
+          rows: new Set()
         };
       }
-      occurrences[key].rows.push(parseInt(row_id));
+      const rid = parseInt(row_id, 10);
+      if (!Number.isNaN(rid)) occurrences[key].rows.add(rid);
     }
 
     return occurrences;
@@ -1251,24 +1558,21 @@ function separateCommonIds(src2tgt, tgt2src) {
       const srcObj = src2tgt[key];
       const tgtObj = tgt2src[key];
 
-      const srcIds = srcObj.rows;
-      const tgtIds = tgtObj.rows;
+      const srcIds = _rowCollectionToSet(srcObj.rows);
+      const tgtIds = _rowCollectionToSet(tgtObj.rows);
 
-      // Find intersection
-      const commonIds = srcIds.filter(id => tgtIds.includes(id));
+      const commonIds = new Set([...srcIds].filter(id => tgtIds.has(id)));
 
-      if (commonIds.length > 0) {
+      if (commonIds.size > 0) {
         common[key] = { rows: commonIds };
 
-        // Remove common IDs from originals
-        srcObj.rows = srcIds.filter(id => !commonIds.includes(id));
-        tgtObj.rows = tgtIds.filter(id => !commonIds.includes(id));
+        srcObj.rows = new Set([...srcIds].filter(id => !commonIds.has(id)));
+        tgtObj.rows = new Set([...tgtIds].filter(id => !commonIds.has(id)));
 
-        // Optional: update counts after filtering
-        srcObj.count = srcObj.rows.length;
-        tgtObj.count = tgtObj.rows.length;
+        srcObj.count = srcObj.rows.size;
+        tgtObj.count = tgtObj.rows.size;
       } else {
-        common[key] = { rows: [] };
+        common[key] = { rows: new Set() };
       }
     }
   }
@@ -1442,13 +1746,15 @@ async function extractPhrasesBatch(module, src_lines, tgt_lines, align_lines, sc
     // Helper to merge occurrence maps
     const mergeOccurrences = (source) => {
       for (const [key, value] of Object.entries(source)) {
+        const incomingRows = _rowCollectionToSet(value.rows);
         if (occurrences.has(key)) {
           const currentValue = occurrences.get(key);
-          // Use concat with Array.from to avoid spreading large arrays into function args
-          currentValue.rows = currentValue.rows.concat(Array.from(value.rows));
+          currentValue.rows = new Set([
+            ..._rowCollectionToSet(currentValue.rows),
+            ...incomingRows,
+          ]);
         } else {
-          // Make a shallow copy to avoid modifying the original; use Array.from to support Sets/Arrays
-          occurrences.set(key, { ...value, rows: Array.from(value.rows) });
+          occurrences.set(key, { ...value, rows: incomingRows });
         }
       }
     };
@@ -1540,16 +1846,17 @@ async function _extractPhrases(module, pyodide, src_lines, tgt_lines, align_line
             let newCount = 0;
             let mergedCount = 0;
             for (const [key, value] of occurrences_batch.entries()) {
-              let row_ids = Array.from(value.rows);
-
-              row_ids = row_ids.map(id => id + start);
+              const row_ids = Array.from(_rowCollectionToSet(value.rows)).map(id => id + start);
 
               if (occurrences.has(key)) {
                 const currentValue = occurrences.get(key);
-                currentValue.rows = currentValue.rows.concat(row_ids);
+                currentValue.rows = new Set([
+                  ..._rowCollectionToSet(currentValue.rows),
+                  ...row_ids,
+                ]);
                 mergedCount++;
               } else {
-                occurrences.set(key, { ...value, rows: row_ids});
+                occurrences.set(key, { ...value, rows: new Set(row_ids)});
                 newCount++;
               }
             }
@@ -1559,7 +1866,7 @@ async function _extractPhrases(module, pyodide, src_lines, tgt_lines, align_line
             if (occurrences.size > max_phrases) {
               const countBuckets = new Map(); // count -> Set(keys)
               for (const [key, value] of occurrences.entries()) {
-                const c = value.rows.length;
+                const c = _rowCollectionSize(value.rows);
                 let s = countBuckets.get(c);
                 if (!s) {
                   s = new Set();
@@ -1606,7 +1913,7 @@ async function _extractPhrases(module, pyodide, src_lines, tgt_lines, align_line
     }
 
     for (const [key, value] of occurrences.entries()) {
-      const count = value.rows.length;
+      const count = _rowCollectionSize(value.rows);
       if (count < min_occ || count > max_occ) {
         occurrences.delete(key);
         filteredCount++;
@@ -1621,7 +1928,7 @@ async function _extractPhrases(module, pyodide, src_lines, tgt_lines, align_line
         src_phrase: src_phrase || '',
         tgt_phrase: tgt_phrase || '',
         direction: value.direction ?? 0,
-        num_occurrences: Array.isArray(value.rows) ? value.rows.length : (value.rows instanceof Set ? value.rows.size : 0),
+        num_occurrences: _rowCollectionSize(value.rows),
         occurrences: Array.from(value.rows)
       };
     });
@@ -1761,12 +2068,36 @@ export async function extractPhrases(project_id) {
           console.warn("⚠️ Morph form-alignment scan failed (continuing):", e);
         }
 
-        cacheRobustnessReport(project_id, phrases, {
+        try {
+          const dictRes = await _autoAddDictionaryHiddenPhrases(project_id, phrases, pyodide, {
+            allowedDirections: new Set(["0"]),
+            singleTokenOnly: true,
+            maxExamplePairs: 20,
+            doImport: false,
+          });
+
+          cacheDictionaryHiddenCandidates(project_id, {
+            pairs: dictRes.pairs,
+            examples: dictRes.examples,
+            params: dictRes.params
+          });
+
+          stats_obj.dictionary_candidates = dictRes.found;
+          stats_obj.dictionary_examples = dictRes.examples;
+
+          console.log(`ℹ️ Dictionary-based hidden candidates (not hidden automatically): ${dictRes.found.toLocaleString()}`);
+        } catch (e) {
+          console.warn("⚠️ Dictionary scan failed (continuing):", e);
+        }
+
+        cacheConsistencyReport(project_id, phrases, {
           // overall phrase pairs currently in memory (after extraction filters)
           total_phrase_pairs_extracted: Array.isArray(phrases) ? phrases.length : 0,
 
           form_aligned_candidates: stats_obj.form_aligned_candidates ?? 0,
           form_aligned_examples: stats_obj.form_aligned_examples ?? [],
+          dictionary_candidates: stats_obj.dictionary_candidates ?? 0,
+          dictionary_examples: stats_obj.dictionary_examples ?? [],
         });
 
     } catch (err) {
@@ -1778,6 +2109,186 @@ export async function extractPhrases(project_id) {
     return stats_obj;
 }
 
+
+
+function _normalizeDirectionsForOverview(directions) {
+  if (directions instanceof Set) return directions;
+  if (Array.isArray(directions)) return new Set(directions.map(String));
+  return new Set(["0"]);
+}
+
+function _getVariantShareForSuspicion(variant, total) {
+  if (!variant) return 0;
+  const share = Number(variant.share);
+  if (Number.isFinite(share) && share >= 0) return share;
+  const count = Number(variant.count || 0);
+  return total > 0 ? (count / total) : 0;
+}
+
+function _getSuspicionMeta(row) {
+  const total = Number(row.num_occurrences || row.total || 0);
+  const topShare = Number(row.top_share || 0);
+  const numTgts = Number(row.num_tgts || 0);
+  const topk = Array.isArray(row.topk) ? row.topk : [];
+  const secondShare = _getVariantShareForSuspicion(topk[1], total);
+  const gap = Math.max(0, topShare - secondShare);
+  const reasons = [];
+  let score = 0;
+
+  if (total >= 20 && topShare < 0.60) {
+    reasons.push('very low consistency');
+    score += 5;
+  } else if (total >= 10 && topShare < 0.75) {
+    reasons.push('low consistency');
+    score += 3;
+  } else if (total >= 5 && topShare < 0.65) {
+    reasons.push('unstable');
+    score += 2;
+  }
+
+  if (total >= 10 && numTgts >= 5) {
+    reasons.push('many variants');
+    score += 3;
+  } else if (total >= 10 && numTgts >= 4) {
+    reasons.push('several variants');
+    score += 2;
+  }
+
+  if (total >= 10 && secondShare >= 0.20 && gap <= 0.15) {
+    reasons.push('top variants close');
+    score += 2;
+  }
+
+  if (total >= 30 && topShare < 0.80) {
+    score += 1;
+  }
+
+  return {
+    suspicious: reasons.length > 0,
+    suspicious_score: score,
+    suspicious_reasons: reasons,
+    top2_share: secondShare,
+    top2_gap: gap,
+  };
+}
+
+function _sortPhraseOverviewRows(rows, sortMode = "frequency") {
+  const out = [...rows];
+  if (sortMode === "worst_consistency") {
+    out.sort((a, b) =>
+      Number(a.top_share) - Number(b.top_share) ||
+      Number(b.num_occurrences) - Number(a.num_occurrences) ||
+      Number(b.num_tgts) - Number(a.num_tgts) ||
+      String(a.src_phrase).localeCompare(String(b.src_phrase))
+    );
+    return out;
+  }
+
+  if (sortMode === "suspicious") {
+    out.sort((a, b) =>
+      Number(Boolean(b.suspicious)) - Number(Boolean(a.suspicious)) ||
+      Number(b.suspicious_score || 0) - Number(a.suspicious_score || 0) ||
+      Number(a.top_share) - Number(b.top_share) ||
+      Number(b.num_occurrences) - Number(a.num_occurrences) ||
+      Number(b.num_tgts) - Number(a.num_tgts) ||
+      String(a.src_phrase).localeCompare(String(b.src_phrase))
+    );
+    return out;
+  }
+
+  out.sort((a, b) =>
+    Number(b.num_occurrences) - Number(a.num_occurrences) ||
+    Number(a.top_share) - Number(b.top_share) ||
+    String(a.src_phrase).localeCompare(String(b.src_phrase))
+  );
+  return out;
+}
+
+export async function fetchPhraseOverview(data) {
+  const phrases = getCachedExtractedPhrases(data.project_id);
+  if (!phrases) {
+    console.warn("Phrase overview falling back to fetchPhrases() because no cached extraction is available in this session.");
+    return fetchPhrases(data);
+  }
+
+  const directions = _normalizeDirectionsForOverview(data.directions);
+  const singleTokenOnly = data.singleTokenOnly !== false;
+  const minTotal = Math.max(1, Number(data.minTotal || 1));
+  const hideConsistency = data.hideConsistency === true;
+  const hideFormAligned = data.hideFormAligned === true;
+  const hideDictionary = data.hideDictionary === true;
+  const suspiciousOnly = data.suspiciousOnly === true;
+  const sortMode = data.sortMode || "frequency";
+  const searchValue = String(data.search?.value || "").trim().toLowerCase();
+
+  const base = buildBasePhraseTableForDownloads(phrases, { minTotal, topK: 15 });
+
+  const consistency = _buildConsistencyHiddenCandidatesFromCachedPhrases(data.project_id, {
+    directions,
+    singleTokenOnly: true,
+    minTotal: DEFAULT_FILTER_MIN_TOTAL,
+    confidenceSplit: SURE_TOP_SHARE,
+  });
+
+  const consistencySet = _setFromPairs(consistency.pairs || []);
+  const formSet = _setFromPairs((getCachedFormAlignedCandidates(data.project_id)?.pairs || []).filter(p => p?.src && p?.tgt));
+  const dictionarySet = _setFromPairs((getCachedDictionaryHiddenCandidates(data.project_id)?.pairs || []).filter(p => p?.src && p?.tgt));
+
+  let rows = (base.rows || [])
+    .filter((r) => directions.has(String(r.direction ?? "0")))
+    .filter((r) => !singleTokenOnly || _isSingleToken(r.src))
+    .map((r) => {
+      const src_phrase = (r.src || "").trim();
+      const tgt_phrase = (r.top_tgt || "").trim();
+      const key = `${src_phrase}${tgt_phrase}`;
+      const outRow = {
+        id: `${String(r.direction ?? "0")}|||${src_phrase}|||${tgt_phrase}`,
+        src_phrase,
+        tgt_phrase,
+        direction: String(r.direction ?? "0"),
+        num_occurrences: Number(r.total || 0),
+        top_share: Number(r.top_share || 0),
+        top_count: Number(r.top_count || 0),
+        num_tgts: Number(r.num_tgts || 0),
+        entropy: Number(r.entropy || 0),
+        topk: r.topk || [],
+        hidden_by_consistency: consistencySet.has(key),
+        hidden_by_form: formSet.has(key),
+        hidden_by_dictionary: dictionarySet.has(key),
+      };
+      return {
+        ...outRow,
+        ..._getSuspicionMeta(outRow),
+      };
+    });
+
+  const recordsTotal = rows.length;
+
+  if (hideConsistency) rows = rows.filter((r) => !r.hidden_by_consistency);
+  if (hideFormAligned) rows = rows.filter((r) => !r.hidden_by_form);
+  if (hideDictionary) rows = rows.filter((r) => !r.hidden_by_dictionary);
+  if (suspiciousOnly) rows = rows.filter((r) => r.suspicious);
+
+  if (searchValue) {
+    rows = rows.filter((r) =>
+      String(r.src_phrase).toLowerCase().includes(searchValue) ||
+      String(r.tgt_phrase).toLowerCase().includes(searchValue)
+    );
+  }
+
+  rows = _sortPhraseOverviewRows(rows, sortMode);
+
+  const recordsFiltered = rows.length;
+  const start = Math.max(0, Number(data.start || 0));
+  const length = Math.max(1, Number(data.length || rows.length || 10));
+
+  return {
+    draw: data.draw,
+    recordsTotal,
+    recordsFiltered,
+    data: rows.slice(start, start + length),
+  };
+}
 
 export async function fetchPhrases(data) {
 
@@ -1930,6 +2441,12 @@ export async function importIgnoredFromFile(project_id, fileContent) {
   return;
 }
 
+
+export async function ignorePhrasePair(project_id, src_phrase, tgt_phrase) {
+  const payload = JSON.stringify([{ src: src_phrase, tgt: tgt_phrase }], null, 2);
+  await importIgnoredFromFile(project_id, payload);
+}
+
 export async function downloadIgnoredPhrases(project_id) {
   
   const pyodide = await initPyodide();
@@ -2001,23 +2518,26 @@ export async function downloadPhrases(project_id) {
 
 }
 
-export function downloadPhrasesExcludingReport(project_id) {
+export function downloadPhrasesExcludingReport(project_id, opts = {}) {
   const ts = new Date().toISOString().replace(/[:]/g, "-");
 
   // 1) Translation overview text (cached from last extraction)
   const overviewText =
-    localStorage.getItem(ROBUSTNESS_CACHE_KEY_TEXT(project_id)) ||
+    localStorage.getItem(CONSISTENCY_CACHE_KEY_TEXT(project_id)) || localStorage.getItem(ROBUSTNESS_CACHE_KEY_TEXT(project_id)) ||
     `No translation overview cached for project ${project_id}.\nRun "Extract phrases" first.\n`;
 
   // 2) Hidden-selection report (robust + form-aligned)
   //    (does NOT download anything, just returns text)
   let hiddenSelectionText = "";
   try {
-    const { reportText } = buildRobustAndFormHiddenArtifacts(project_id, {
-      robustDirections: new Set(["0"]),
-      robustSingleTokenOnly: false,
-      robustMinTotal: DEFAULT_FILTER_MIN_TOTAL,
-      robustConfidenceSplit: SURE_TOP_SHARE,
+    const { reportText } = buildHiddenPhraseArtifacts(project_id, {
+      includeConsistency: opts.includeConsistency !== false,
+      includeFormAligned: opts.includeFormAligned !== false,
+      includeDictionary: opts.includeDictionary !== false,
+      consistencyDirections: opts.directions || new Set(["0"]),
+      consistencySingleTokenOnly: false,
+      consistencyMinTotal: DEFAULT_FILTER_MIN_TOTAL,
+      consistencyConfidenceSplit: SURE_TOP_SHARE,
       maxExamplesPerGroup: 12,
     });
     hiddenSelectionText = reportText;
