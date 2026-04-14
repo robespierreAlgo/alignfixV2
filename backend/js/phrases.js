@@ -20,8 +20,78 @@ import { nextFrame } from "../../ui/utils.js";
 import { getLinesStats } from "./stats.js"; 
 import { safeSyncfs } from "./storage.js";
 
-console.log("phrases.js loaded: v=2026-03-16-auto-refresh-ui");
+// console.log("phrases.js loaded: v=2026-03-16-auto-refresh-ui");
 const SAVE_BATCH_SIZE = 100000; // adjust based on memory
+
+const UNALIGNED_SENTINEL = "__ALIGNFIX_UNALIGNED__";
+
+async function _fetchUnalignedCountsForSources(projectId, srcPhrases) {
+  const uniqueSrc = Array.from(new Set((srcPhrases || []).map(x => String(x || '').trim()).filter(Boolean)));
+  if (!uniqueSrc.length) return {};
+
+  const pyodide = await initPyodide();
+  pyodide.globals.set("project_id", Number(projectId));
+  pyodide.globals.set("src_phrases", uniqueSrc);
+
+  const response = await pyodide.runPythonAsync(`
+import json
+from projects import get_unaligned_src_counts
+json.dumps(get_unaligned_src_counts(project_id, src_phrases))
+  `);
+
+  return JSON.parse(response || '{}');
+}
+
+async function _augmentRowsWithUnaligned(projectId, rows) {
+  if (!Array.isArray(rows) || !rows.length) return rows || [];
+  const singleTokenRows = rows.filter(r => _isSingleToken(r?.src_phrase || r?.src || ''));
+  if (!singleTokenRows.length) return rows;
+
+  const countsBySrc = await _fetchUnalignedCountsForSources(projectId, singleTokenRows.map(r => r.src_phrase || r.src));
+
+  return rows.map((row) => {
+    const srcPhrase = String(row?.src_phrase || row?.src || '').trim();
+    const unalignedCount = Number(countsBySrc[srcPhrase] || 0);
+    const alignedTotal = Number(row?.num_occurrences ?? row?.total ?? 0);
+    const total = alignedTotal + unalignedCount;
+    const alignedTopkRaw = Array.isArray(row?.topk) ? [...row.topk] : [];
+    const alignedTopk = alignedTopkRaw
+      .filter(v => String(v?.tgt || '').trim() !== UNALIGNED_SENTINEL)
+      .map((v) => ({
+        ...v,
+        share: total ? (Number(v?.count || 0) / total) : 0,
+      }))
+      .sort((a, b) => Number(b?.count || 0) - Number(a?.count || 0));
+
+    const bestAligned = alignedTopk[0] || null;
+    const bestAlignedCount = Number(bestAligned?.count || row?.top_count || 0);
+    const bestAlignedTgt = String(bestAligned?.tgt || row?.tgt_phrase || row?.top_tgt || '').trim();
+
+    const topk = [...alignedTopk];
+    if (unalignedCount > 0) {
+      topk.push({
+        tgt: UNALIGNED_SENTINEL,
+        count: unalignedCount,
+        share: total ? unalignedCount / total : 0,
+        is_unaligned: true,
+      });
+    }
+
+    return {
+      ...row,
+      num_occurrences: total,
+      total,
+      top_tgt: bestAlignedTgt,
+      tgt_phrase: row?.tgt_phrase || bestAlignedTgt,
+      top_count: bestAlignedCount,
+      top_share: total ? bestAlignedCount / total : 0,
+      num_tgts: Number(row?.num_tgts || 0),
+      topk,
+      unaligned_count: unalignedCount,
+      unaligned_share: total ? unalignedCount / total : 0,
+    };
+  });
+}
 
 // =======================
 // Full Phrase Translation Table (CSV/JSON)
@@ -29,8 +99,10 @@ const SAVE_BATCH_SIZE = 100000; // adjust based on memory
 // =======================
 
 // In-memory cache so downloads can happen synchronously on button click (no awaits).
-// If user reloads the page, they need to re-run Extract phrases before downloading.
+// If user reloads the page, raw extracted phrases are not restored, but the compact overview rows are.
 const _LAST_EXTRACTED_PHRASES_BY_PROJECT = new Map();
+const _LAST_PHRASE_OVERVIEW_ROWS_BY_PROJECT = new Map();
+const PHRASE_OVERVIEW_CACHE_KEY = (projectId) => `alignfix:v2:phrase_overview_rows:${projectId}`;
 
 function cacheExtractedPhrases(projectId, phrasesArray) {
   _LAST_EXTRACTED_PHRASES_BY_PROJECT.set(String(projectId), phrasesArray);
@@ -38,6 +110,34 @@ function cacheExtractedPhrases(projectId, phrasesArray) {
 
 function getCachedExtractedPhrases(projectId) {
   return _LAST_EXTRACTED_PHRASES_BY_PROJECT.get(String(projectId)) || null;
+}
+
+function cachePhraseOverviewRows(projectId, rows) {
+  const projectKey = String(projectId);
+  const payload = Array.isArray(rows) ? rows : [];
+  _LAST_PHRASE_OVERVIEW_ROWS_BY_PROJECT.set(projectKey, payload);
+  try {
+    localStorage.setItem(PHRASE_OVERVIEW_CACHE_KEY(projectKey), JSON.stringify(payload));
+  } catch (e) {
+    console.warn("⚠️ Could not persist phrase overview rows to localStorage:", e);
+  }
+}
+
+function getCachedPhraseOverviewRows(projectId) {
+  const projectKey = String(projectId);
+  const mem = _LAST_PHRASE_OVERVIEW_ROWS_BY_PROJECT.get(projectKey);
+  if (mem) return mem;
+  try {
+    const raw = localStorage.getItem(PHRASE_OVERVIEW_CACHE_KEY(projectKey));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const rows = Array.isArray(parsed) ? parsed : [];
+    _LAST_PHRASE_OVERVIEW_ROWS_BY_PROJECT.set(projectKey, rows);
+    return rows;
+  } catch (e) {
+    console.warn("⚠️ Could not restore phrase overview rows from localStorage:", e);
+    return null;
+  }
 }
 
 // Cache form-aligned candidates from the last extraction.
@@ -2100,6 +2200,8 @@ export async function extractPhrases(project_id) {
           dictionary_examples: stats_obj.dictionary_examples ?? [],
         });
 
+        await _buildPhraseOverviewRowsFromExtracted(project_id, phrases);
+
     } catch (err) {
         console.error('❌ Critical error during phrase processing:', err.message || err);
         throw err;
@@ -2135,32 +2237,19 @@ function _getSuspicionMeta(row) {
   const reasons = [];
   let score = 0;
 
-  if (total >= 20 && topShare < 0.60) {
-    reasons.push('very low consistency');
-    score += 5;
-  } else if (total >= 10 && topShare < 0.75) {
+  if (total >= 10 && topShare < 0.65) {
     reasons.push('low consistency');
     score += 3;
-  } else if (total >= 5 && topShare < 0.65) {
-    reasons.push('unstable');
-    score += 2;
   }
 
-  if (total >= 10 && numTgts >= 5) {
+  if (total >= 10 && numTgts >= 4) {
     reasons.push('many variants');
-    score += 3;
-  } else if (total >= 10 && numTgts >= 4) {
-    reasons.push('several variants');
     score += 2;
   }
 
   if (total >= 10 && secondShare >= 0.20 && gap <= 0.15) {
     reasons.push('top variants close');
     score += 2;
-  }
-
-  if (total >= 30 && topShare < 0.80) {
-    score += 1;
   }
 
   return {
@@ -2204,12 +2293,53 @@ function _sortPhraseOverviewRows(rows, sortMode = "frequency") {
   return out;
 }
 
+async function _buildPhraseOverviewRowsFromExtracted(projectId, phrases) {
+  const base = buildBasePhraseTableForDownloads(phrases, { minTotal: 1, topK: 1000 });
+
+  const consistency = _buildConsistencyHiddenCandidatesFromCachedPhrases(projectId, {
+    directions: new Set(["0"]),
+    singleTokenOnly: true,
+    minTotal: DEFAULT_FILTER_MIN_TOTAL,
+    confidenceSplit: SURE_TOP_SHARE,
+  });
+
+  const consistencySet = _setFromPairs(consistency.pairs || []);
+  const formSet = _setFromPairs((getCachedFormAlignedCandidates(projectId)?.pairs || []).filter(p => p?.src && p?.tgt));
+  const dictionarySet = _setFromPairs((getCachedDictionaryHiddenCandidates(projectId)?.pairs || []).filter(p => p?.src && p?.tgt));
+
+  let rows = (base.rows || []).map((r) => {
+    const src_phrase = (r.src || "").trim();
+    const tgt_phrase = (r.top_tgt || "").trim();
+    const key = `${src_phrase}${tgt_phrase}`;
+    return {
+      id: `${String(r.direction ?? "0")}|||${src_phrase}|||${tgt_phrase}`,
+      src_phrase,
+      tgt_phrase,
+      direction: String(r.direction ?? "0"),
+      num_occurrences: Number(r.total || 0),
+      top_share: Number(r.top_share || 0),
+      top_count: Number(r.top_count || 0),
+      num_tgts: Number(r.num_tgts || 0),
+      entropy: Number(r.entropy || 0),
+      topk: r.topk || [],
+      hidden_by_consistency: consistencySet.has(key),
+      hidden_by_form: formSet.has(key),
+      hidden_by_dictionary: dictionarySet.has(key),
+    };
+  });
+
+  rows = await _augmentRowsWithUnaligned(projectId, rows);
+  rows = rows.map((row) => ({
+    ...row,
+    ..._getSuspicionMeta(row),
+  }));
+
+  cachePhraseOverviewRows(projectId, rows);
+  return rows;
+}
+
 export async function fetchPhraseOverview(data) {
   const phrases = getCachedExtractedPhrases(data.project_id);
-  if (!phrases) {
-    console.warn("Phrase overview falling back to fetchPhrases() because no cached extraction is available in this session.");
-    return fetchPhrases(data);
-  }
 
   const directions = _normalizeDirectionsForOverview(data.directions);
   const singleTokenOnly = data.singleTokenOnly !== false;
@@ -2221,46 +2351,21 @@ export async function fetchPhraseOverview(data) {
   const sortMode = data.sortMode || "frequency";
   const searchValue = String(data.search?.value || "").trim().toLowerCase();
 
-  const base = buildBasePhraseTableForDownloads(phrases, { minTotal, topK: 15 });
+  let rows = null;
+  if (phrases) {
+    rows = await _buildPhraseOverviewRowsFromExtracted(data.project_id, phrases);
+  } else {
+    rows = getCachedPhraseOverviewRows(data.project_id);
+    if (!rows) {
+      console.warn("Phrase overview falling back to fetchPhrases() because no cached extraction or overview is available.");
+      return fetchPhrases(data);
+    }
+  }
 
-  const consistency = _buildConsistencyHiddenCandidatesFromCachedPhrases(data.project_id, {
-    directions,
-    singleTokenOnly: true,
-    minTotal: DEFAULT_FILTER_MIN_TOTAL,
-    confidenceSplit: SURE_TOP_SHARE,
-  });
-
-  const consistencySet = _setFromPairs(consistency.pairs || []);
-  const formSet = _setFromPairs((getCachedFormAlignedCandidates(data.project_id)?.pairs || []).filter(p => p?.src && p?.tgt));
-  const dictionarySet = _setFromPairs((getCachedDictionaryHiddenCandidates(data.project_id)?.pairs || []).filter(p => p?.src && p?.tgt));
-
-  let rows = (base.rows || [])
+  rows = [...rows]
     .filter((r) => directions.has(String(r.direction ?? "0")))
-    .filter((r) => !singleTokenOnly || _isSingleToken(r.src))
-    .map((r) => {
-      const src_phrase = (r.src || "").trim();
-      const tgt_phrase = (r.top_tgt || "").trim();
-      const key = `${src_phrase}${tgt_phrase}`;
-      const outRow = {
-        id: `${String(r.direction ?? "0")}|||${src_phrase}|||${tgt_phrase}`,
-        src_phrase,
-        tgt_phrase,
-        direction: String(r.direction ?? "0"),
-        num_occurrences: Number(r.total || 0),
-        top_share: Number(r.top_share || 0),
-        top_count: Number(r.top_count || 0),
-        num_tgts: Number(r.num_tgts || 0),
-        entropy: Number(r.entropy || 0),
-        topk: r.topk || [],
-        hidden_by_consistency: consistencySet.has(key),
-        hidden_by_form: formSet.has(key),
-        hidden_by_dictionary: dictionarySet.has(key),
-      };
-      return {
-        ...outRow,
-        ..._getSuspicionMeta(outRow),
-      };
-    });
+    .filter((r) => Number(r.num_occurrences || 0) >= minTotal)
+    .filter((r) => !singleTokenOnly || _isSingleToken(r.src_phrase || r.src));
 
   const recordsTotal = rows.length;
 

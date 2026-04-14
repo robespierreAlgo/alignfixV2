@@ -43,6 +43,8 @@ import { profiler } from "./profiler.js";
 let fixes = [];  // global list of fixes
 let ignored = [];
 
+const UNALIGNED_SENTINEL = "__ALIGNFIX_UNALIGNED__";
+
 function getDirectionSymbol(direction) {
   switch (String(direction)) {
     case '1':
@@ -93,36 +95,55 @@ function normalizeVisibleHtml(html) {
 }
 
 function renderVariantPanel(row) {
-  const topk = Array.isArray(row.topk) ? row.topk : [];
-  const variantsShown = topk.length;
-  const totalVariants = Number.isFinite(Number(row.num_tgts)) ? Number(row.num_tgts) : variantsShown;
+  const rawTopk = Array.isArray(row.topk) ? row.topk : [];
+  const topk = rawTopk.map(v => ({ ...v }));
   const srcPretty = normalizePhraseDisplay(row.src_phrase);
 
-  if (!variantsShown || totalVariants <= 1) {
+  const hasExplicitUnaligned = topk.some(v => String(v?.tgt || '').trim() === UNALIGNED_SENTINEL);
+  const unalignedCount = Number(row?.unaligned_count || 0);
+  if (unalignedCount > 0 && !hasExplicitUnaligned) {
+    topk.push({
+      tgt: UNALIGNED_SENTINEL,
+      count: unalignedCount,
+      share: Number(row?.unaligned_share || 0),
+      is_unaligned: true,
+    });
+  }
+
+  const alignedVariantsShown = topk.filter(v => String(v?.tgt || '').trim() !== UNALIGNED_SENTINEL && !v?.is_unaligned).length;
+  const totalVariants = Number.isFinite(Number(row.num_tgts)) ? Number(row.num_tgts) : alignedVariantsShown;
+  const hasUnaligned = topk.some(v => String(v?.tgt || '').trim() === UNALIGNED_SENTINEL || v?.is_unaligned);
+  const canOpenPanel = topk.length > 0 && (totalVariants > 1 || hasUnaligned);
+
+  if (!topk.length) {
+    return `<span>variants: <strong>${totalVariants}</strong></span>`;
+  }
+
+  if (!canOpenPanel) {
     return `<span>variants: <strong>${totalVariants || 1}</strong></span>`;
   }
 
   const variantButtons = topk.map((variant, idx) => {
-    const tgt = String(variant?.tgt || '').trim();
-    const tgtPretty = normalizePhraseDisplay(tgt);
+    const rawTgt = String(variant?.tgt || '').trim();
+    const isUnaligned = rawTgt === UNALIGNED_SENTINEL || variant?.is_unaligned;
+    const tgtPretty = isUnaligned ? 'unaligned' : normalizePhraseDisplay(rawTgt);
     const count = Number(variant?.count || 0);
     const share = formatPct(variant?.share || 0);
     const btnClass = idx === 0 ? 'btn-outline-primary' : 'btn-outline-secondary';
+    const titleTail = isUnaligned
+      ? `${escapeForHtmlAttr(srcPretty)} ${getDirectionSymbol(row.direction)} ∅`
+      : `${escapeForHtmlAttr(srcPretty)} ${getDirectionSymbol(row.direction)} ${escapeForHtmlAttr(tgtPretty)}`;
 
     return `<button
       type="button"
       class="btn btn-sm ${btnClass} show-variant-btn"
       data-src="${escapeForHtmlAttr(row.src_phrase)}"
-      data-tgt="${escapeForHtmlAttr(tgt)}"
+      data-tgt="${escapeForHtmlAttr(isUnaligned ? '' : rawTgt)}"
       data-direction="${escapeForHtmlAttr(row.direction)}"
-      title="Show sentence pairs for ${escapeForHtmlAttr(srcPretty)} ${getDirectionSymbol(row.direction)} ${escapeForHtmlAttr(tgtPretty)}"
+      data-unaligned="${isUnaligned ? '1' : '0'}"
+      title="Show sentence pairs for ${titleTail}"
     >${escapeForHtmlAttr(tgtPretty)} <span class="text-muted">(${count}, ${share})</span></button>`;
   }).join(' ');
-
-  const moreCount = Math.max(0, totalVariants - variantsShown);
-  const moreLine = moreCount > 0
-    ? `<div class="small text-muted mt-2">+ ${moreCount} more variant${moreCount === 1 ? '' : 's'} not shown here.</div>`
-    : '';
 
   return `
     <button type="button" class="btn btn-sm btn-link p-0 align-baseline toggle-variants-btn text-decoration-none">
@@ -131,8 +152,6 @@ function renderVariantPanel(row) {
     <div class="variant-list-panel d-none mt-2 border rounded p-2 bg-light-subtle">
       <div class="small fw-semibold mb-2">Variants for <span class="text-body">${escapeForHtmlAttr(srcPretty)}</span></div>
       <div class="d-flex flex-wrap gap-2">${variantButtons}</div>
-      <div class="small text-muted mt-2">Click a variant to load the matching sentence pairs on the right.</div>
-      ${moreLine}
     </div>
   `;
 }
@@ -158,7 +177,7 @@ function renderPhraseOverviewCell(row) {
   const srcPretty = normalizePhraseDisplay(row.src_phrase);
   const tgtPretty = normalizePhraseDisplay(row.tgt_phrase);
   const suspicionHtml = renderSuspicionSummary(row);
-  const pairCount = Number.isFinite(Number(row.top_count)) ? Number(row.top_count) : Number(row.num_occurrences || 0);
+  const pairCount = Number.isFinite(Number(row.num_occurrences)) ? Number(row.num_occurrences) : Number(row.top_count || 0);
   const totalCount = Number.isFinite(Number(row.num_occurrences)) ? Number(row.num_occurrences) : pairCount;
 
   return `
@@ -168,7 +187,7 @@ function renderPhraseOverviewCell(row) {
         data-src="${escapeForHtmlAttr(row.src_phrase)}"
         data-tgt="${escapeForHtmlAttr(row.tgt_phrase)}"
         data-direction="${row.direction}"
-        title="Show sentence pairs for the top translation (${pairCount} matching sentence pair${pairCount === 1 ? '' : 's'})"
+        title="Show all matching sentence pairs for this source phrase (${pairCount} sentence pair${pairCount === 1 ? '' : 's'})"
       >
         <i class="fas fa-search"></i> ${pairCount}
       </button>
@@ -300,15 +319,18 @@ export async function renderProject(id) {
             <input class="form-check-input" type="checkbox" id="toggle-suspicious-only">
             <label class="form-check-label" for="toggle-suspicious-only">Show suspicious only</label>
           </div>
-          <div class="small text-muted mt-1">
-            Suspicious = low consistency, many variants, or very close top alternatives.
-          </div>
+          <details class="mt-2 small">
+            <summary class="text-primary" style="cursor:pointer; user-select:none;">How “suspicious” is defined</summary>
+            <div class="text-muted mt-2">
+              <div>&gt; Suspicious if one of these holds:</div>
+              <div class="mt-1">• consistency &lt; 65% with 10+ occurrences</div>
+              <div>• 4+ aligned variants with 10+ occurrences</div>
+              <div>• two strong options with 10+ occurrences: the second shown is still frequent (20%+) and close to the best (gap 15 pts or less)</div>
+            </div>
+          </details>
           <button id="refresh-overview-btn" class="btn btn-outline-primary btn-sm mt-2">
             <i class="fas fa-rotate-right me-1"></i> Refresh overview
           </button>
-          <div class="form-text mt-2">
-            The word list above updates automatically from the last extracted phrases in this browser session.
-          </div>
         </div>
       </div>
       <!-- Fixes Preview -->
@@ -803,6 +825,8 @@ export async function renderProject(id) {
       d.fix2 = $('#fix-fix2').val();
       d.direction = $('#fix-direction').val();
       d.project_id = id;  // add project ID to request data
+      d.unaligned_only = $('#translations-table').data('unaligned-only') === true;
+      d.all_occurrences = $('#translations-table').data('all-occurrences') === true;
       const result = await fetchTranslations(d);
       callback(result); // DataTable expects JSON in correct format
     },
@@ -912,7 +936,7 @@ export async function renderProject(id) {
       const src = btn.dataset.src;
       const tgt = btn.dataset.tgt;
       const direction = btn.dataset.direction;
-      btn.addEventListener('click', () => showTranslations(src, tgt, direction));
+      btn.addEventListener('click', () => showTranslations(src, '', direction, '', '', { allOccurrences: true }));
     });
     document.querySelectorAll('.toggle-variants-btn').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -929,8 +953,9 @@ export async function renderProject(id) {
         const src = btn.dataset.src;
         const tgt = btn.dataset.tgt;
         const direction = btn.dataset.direction;
+        const unalignedOnly = btn.dataset.unaligned === '1';
         markActiveVariantButton(btn);
-        showTranslations(src, tgt, direction);
+        showTranslations(src, tgt, direction, '', '', { unalignedOnly });
       });
     });
   });
@@ -979,9 +1004,13 @@ export async function renderProject(id) {
   );
 }
 
-function showTranslations(phrase1, phrase2, direction, fix1 = '', fix2 = '') {
+function showTranslations(phrase1, phrase2, direction, fix1 = '', fix2 = '', opts = {}) {
+  const unalignedOnly = opts?.unalignedOnly === true;
+  const allOccurrences = opts?.allOccurrences === true;
 
-  let fix = fixes.find(f => f.phrase1 === phrase1 && f.phrase2 === phrase2 && f.direction === direction);
+  let fix = (unalignedOnly || allOccurrences)
+    ? null
+    : fixes.find(f => f.phrase1 === phrase1 && f.phrase2 === phrase2 && f.direction === direction);
 
   if (fix) {
     fix1 = fix.fix1;
@@ -993,21 +1022,26 @@ function showTranslations(phrase1, phrase2, direction, fix1 = '', fix2 = '') {
 
   $('#fix-test1').val(phrase1);
   $('#fix-fix1').val(fix1);
-  $('#fix-test2').val(phrase2);
-  $('#fix-fix2').val(fix2);
+  $('#fix-test2').val((unalignedOnly || allOccurrences) ? '' : phrase2);
+  $('#fix-fix2').val((unalignedOnly || allOccurrences) ? '' : fix2);
   $('#fix-direction').val(direction);
+  $('#translations-table').data('unaligned-only', unalignedOnly);
+  $('#translations-table').data('all-occurrences', allOccurrences);
 
-  if (direction == 1) {
-    // set fix-fix.1 disabled
+  if (unalignedOnly || allOccurrences) {
+    $('#fix-fix1').prop('disabled', false);
+    $('#fix-fix2').prop('disabled', true);
+  } else if (direction == 1) {
     $('#fix-fix1').prop('disabled', true);
+    $('#fix-fix2').prop('disabled', false);
   } else if (direction == -1) {
+    $('#fix-fix1').prop('disabled', false);
     $('#fix-fix2').prop('disabled', true);
   } else {
     $('#fix-fix1').prop('disabled', false);
     $('#fix-fix2').prop('disabled', false);
   }
 
-  // reset to first page
   $('#translations-table').DataTable().page('first').draw('page');
 
   const translationsEl = document.getElementById('translations-table');

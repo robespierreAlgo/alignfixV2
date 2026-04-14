@@ -30,6 +30,8 @@ export async function fetchTranslations(data) {
   pyodide.globals.set("start", data.start);
   pyodide.globals.set("length", data.length);
   pyodide.globals.set("search_value", data.search.value);
+  pyodide.globals.set("unaligned_only", !!data.unaligned_only);
+  pyodide.globals.set("all_occurrences", !!data.all_occurrences);
 
   console.log(`Fetching translations for project ${data.project_id} - Phrase1: "${data.phrase1}", Phrase2: "${data.phrase2}", Search: "${data.search.value}"`);
 
@@ -38,7 +40,7 @@ export async function fetchTranslations(data) {
       from projects import fetch_translations
 
       res, total_records = fetch_translations(
-          project_id, phrase1, phrase2, fix1, fix2, direction, start, length, search_value
+          project_id, phrase1, phrase2, fix1, fix2, direction, start, length, search_value, unaligned_only, all_occurrences
       )
       json.dumps({
           "data": res,

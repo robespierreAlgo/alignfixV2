@@ -138,7 +138,7 @@ export async function computeAlignments(srcLines, tgtLines) {
   const numCores = parseInt(document.getElementById("num-cores-input")?.value) || window.navigator.hardwareConcurrency || 1;
   const poolSize = Math.min(fastAlignConfig.poolSize, numCores);
   
-  const CHUNK_SIZE = getFastAlignChunkSize(numCores);
+  const CHUNK_SIZE = getFastAlignChunkSize(poolSize);
   const totalChunks = Math.ceil(srcLines.length / CHUNK_SIZE);
   
   let module = await createFastAlign({

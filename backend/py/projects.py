@@ -9,6 +9,127 @@ from alignment import parse_alignment
 from phrases import get_directed_phrases_from_texts_and_alignment, get_phrase_occurrences
 from db import get_db
 
+
+UNALIGNED_SENTINEL = "__ALIGNFIX_UNALIGNED__"
+
+def _src_token_is_unaligned(src_idx, alignment_pairs):
+    for a, _ in alignment_pairs or []:
+        if a == src_idx:
+            return False
+    return True
+
+def _find_unaligned_src_positions(src_tokens, alignment_pairs, src_phrase_tok):
+    if not src_phrase_tok or len(src_phrase_tok) != 1:
+        return []
+    needle = src_phrase_tok[0]
+    out = []
+    for i, tok in enumerate(src_tokens or []):
+        if tok == needle and _src_token_is_unaligned(i, alignment_pairs):
+            out.append(i)
+    return out
+
+def get_unaligned_src_counts(project_id, src_phrases, directions=None):
+    src_phrases = [tokenise(x, as_string=True) for x in (src_phrases or [])]
+    src_phrases = [x for x in src_phrases if x and len(x.split()) == 1]
+    if not src_phrases:
+        return {}
+
+    wanted = set(src_phrases)
+    counts = {src: set() for src in wanted}
+
+    _, cursor = get_db()
+    cursor.execute(
+        "SELECT row_id, line1, alignment FROM alignments WHERE project_id=? AND deleted_at IS NULL",
+        (project_id,)
+    )
+
+    for row_id, line1, alignment in cursor.fetchall():
+        src_tokens = str(line1 or "").split()
+        if not src_tokens:
+            continue
+        alignment_pairs = parse_alignment(alignment) if alignment else []
+        aligned_src = {a for a, _ in alignment_pairs}
+
+        for idx, tok in enumerate(src_tokens):
+            if tok in wanted and idx not in aligned_src:
+                counts[tok].add(row_id)
+
+    return {src: len(row_ids) for src, row_ids in counts.items() if row_ids}
+
+def get_unaligned_src_occurrences(project_id, phrase1_tok_str, limit=1000, offset=0):
+    phrase1_tok_str = tokenise(phrase1_tok_str, as_string=True)
+    if not phrase1_tok_str or len(phrase1_tok_str.split()) != 1:
+        return [], 0
+
+    _, cursor = get_db()
+    cursor.execute(
+        "SELECT row_id, line1, line2, alignment, score FROM alignments WHERE project_id=? AND deleted_at IS NULL ORDER BY row_id ASC",
+        (project_id,)
+    )
+
+    matches = []
+    for row_id, line1, line2, alignment, score in cursor.fetchall():
+        src_tokens = str(line1 or "").split()
+        alignment_pairs = parse_alignment(alignment) if alignment else []
+        unaligned_positions = _find_unaligned_src_positions(src_tokens, alignment_pairs, [phrase1_tok_str])
+        if unaligned_positions:
+            matches.append({
+                "row_id": row_id,
+                "line1": line1,
+                "line2": line2,
+                "alignment": alignment,
+                "score": score,
+                "unaligned_positions": unaligned_positions,
+            })
+
+    total = len(matches)
+    return matches[offset: offset + limit], total
+
+def _highlight_src_positions(text, positions, replacement=None):
+    soup = BeautifulSoup("", "html.parser")
+    toks = str(text or "").split()
+    pos_set = set(positions or [])
+    out = []
+    for i, tok in enumerate(toks):
+        if i in pos_set:
+            span = soup.new_tag("span", **{"class": "occurrence src-occurrence"})
+            span.string = replacement if replacement else tok
+            out.append(span)
+        else:
+            out.append(html.escape(tok))
+    return detokenise(out)
+
+def _highlight_unaligned_src_tokens(text, positions, replacement=None):
+    return _highlight_src_positions(text, positions, replacement)
+
+def get_all_src_occurrences(project_id, phrase1_tok_str, limit=1000, offset=0):
+    phrase1_tok_str = tokenise(phrase1_tok_str, as_string=True)
+    if not phrase1_tok_str or len(phrase1_tok_str.split()) != 1:
+        return [], 0
+
+    _, cursor = get_db()
+    cursor.execute(
+        "SELECT row_id, line1, line2, alignment, score FROM alignments WHERE project_id=? AND deleted_at IS NULL ORDER BY row_id ASC",
+        (project_id,)
+    )
+
+    matches = []
+    for row_id, line1, line2, alignment, score in cursor.fetchall():
+        src_tokens = str(line1 or "").split()
+        positions = [i for i, tok in enumerate(src_tokens) if tok == phrase1_tok_str]
+        if positions:
+            matches.append({
+                "row_id": row_id,
+                "line1": line1,
+                "line2": line2,
+                "alignment": alignment,
+                "score": score,
+                "positions": positions,
+            })
+
+    total = len(matches)
+    return matches[offset: offset + limit], total
+
 def create_project(name="Project"):
     conn, cursor = get_db()
     cursor.execute("INSERT INTO projects (name) VALUES (?)", (name,))
@@ -296,7 +417,7 @@ def search_translations(project_id, phrase1, phrase2, search_value=None, start=0
 
     return data, total_records
 
-def fetch_translations(project_id, phrase1, phrase2, fix1, fix2, direction, start, length, search_value):
+def fetch_translations(project_id, phrase1, phrase2, fix1, fix2, direction, start, length, search_value, unaligned_only=False, all_occurrences=False):
 
     data = []
     matches, recordsTotal = [], 0
@@ -308,7 +429,15 @@ def fetch_translations(project_id, phrase1, phrase2, fix1, fix2, direction, star
     search_value_raw = tokenise(search_value, as_string=True)
     search_value_tok = tokenise(search_value)
     
-    if phrase1.strip() or phrase2.strip():
+    if all_occurrences:
+        matches, recordsTotal = get_all_src_occurrences(
+            project_id, phrase1_raw, limit=length, offset=start
+        )
+    elif unaligned_only:
+        matches, recordsTotal = get_unaligned_src_occurrences(
+            project_id, phrase1_raw, limit=length, offset=start
+        )
+    elif phrase1.strip() or phrase2.strip():
         matches, recordsTotal = get_phrase_occurrences(
             project_id, phrase1_raw, phrase2_raw, direction, limit=length, offset=start
         )
@@ -360,73 +489,96 @@ def fetch_translations(project_id, phrase1, phrase2, fix1, fix2, direction, star
 
     else:
 
-        soup = BeautifulSoup("", "html.parser")
-
-        phrase1_num_tok = len(phrase1_tok)
-        phrase2_num_tok = len(phrase2_tok)
-        min_phrase_len = min(phrase1_num_tok, phrase2_num_tok)
-        max_phrase_len = max(phrase1_num_tok, phrase2_num_tok) + 2 # if trimmed #NB
-        
-        docs = get_translations(project_id, matches)
-
-        for doc in docs:
-            src_text = doc['line1']
-            tgt_text = doc['line2']
-
-            src_text_tok = src_text.split()
-            tgt_text_tok = tgt_text.split()
-
-            text1_text2_alignment = parse_alignment(doc['alignment'])
-
-            phrases = get_directed_phrases_from_texts_and_alignment(
-                src_text_tok,
-                tgt_text_tok,
-                text1_text2_alignment,
-                min_phrase_len=min_phrase_len,
-                max_phrase_len=max_phrase_len,
-            )
-
-            # if any entry in phrases matches phrase1 and phrase2
-            entry = find_entry(phrases, phrase1_raw, phrase2_raw)
-
-            if entry:
-                (_, _, direction, src_start, tgt_start) = entry
-
-                src_end = src_start + phrase1_num_tok
-                tgt_end = tgt_start + phrase2_num_tok
-
-                if src_text_tok[src_start:src_end] == phrase1_tok:
-                    rep1 = fix1 if fix1 else phrase1
-                    span = soup.new_tag("span", **{"class": "occurrence src-occurrence"})
-                    span.string = rep1  # this will be properly escaped
-                    src_text_tok = (
-                        [html.escape(x) for x in src_text_tok[:src_start]]
-                        + [span]
-                        + [html.escape(x) for x in src_text_tok[src_end:]]
-                    )
-
-                if tgt_text_tok[tgt_start:tgt_end] == phrase2_tok:
-
-                    rep2 = fix2 if fix2 else phrase2
-                    span = soup.new_tag("span", **{"class": "occurrence tgt-occurrence"})
-                    span.string = rep2  # this will be properly escaped
-
-                    tgt_text_tok = (
-                        [html.escape(x) for x in tgt_text_tok[:tgt_start]]
-                        + [span]
-                        + [html.escape(x) for x in tgt_text_tok[tgt_end:]]
-                    )
-
-                src_text = detokenise(src_text_tok)
-                tgt_text = detokenise(tgt_text_tok)
-
+        if all_occurrences:
+            rep1 = fix1 if fix1 else phrase1
+            for doc in matches:
                 data.append(
                     {
                         "row_id": doc['row_id'],
-                        "line1": src_text,
-                        "line2": tgt_text,
+                        "line1": _highlight_src_positions(doc['line1'], doc.get('positions', []), rep1),
+                        "line2": detokenise(doc['line2']),
                         "score": float(doc['score']),
                     }
                 )
+        elif unaligned_only:
+            rep1 = fix1 if fix1 else phrase1
+            for doc in matches:
+                data.append(
+                    {
+                        "row_id": doc['row_id'],
+                        "line1": _highlight_unaligned_src_tokens(doc['line1'], doc.get('unaligned_positions', []), rep1),
+                        "line2": detokenise(doc['line2']),
+                        "score": float(doc['score']),
+                    }
+                )
+        else:
+            soup = BeautifulSoup("", "html.parser")
+
+            phrase1_num_tok = len(phrase1_tok)
+            phrase2_num_tok = len(phrase2_tok)
+            min_phrase_len = min(phrase1_num_tok, phrase2_num_tok)
+            max_phrase_len = max(phrase1_num_tok, phrase2_num_tok) + 2 # if trimmed #NB
+            
+            docs = get_translations(project_id, matches)
+
+            for doc in docs:
+                src_text = doc['line1']
+                tgt_text = doc['line2']
+
+                src_text_tok = src_text.split()
+                tgt_text_tok = tgt_text.split()
+
+                text1_text2_alignment = parse_alignment(doc['alignment'])
+
+                phrases = get_directed_phrases_from_texts_and_alignment(
+                    src_text_tok,
+                    tgt_text_tok,
+                    text1_text2_alignment,
+                    min_phrase_len=min_phrase_len,
+                    max_phrase_len=max_phrase_len,
+                )
+
+                # if any entry in phrases matches phrase1 and phrase2
+                entry = find_entry(phrases, phrase1_raw, phrase2_raw)
+
+                if entry:
+                    (_, _, direction, src_start, tgt_start) = entry
+
+                    src_end = src_start + phrase1_num_tok
+                    tgt_end = tgt_start + phrase2_num_tok
+
+                    if src_text_tok[src_start:src_end] == phrase1_tok:
+                        rep1 = fix1 if fix1 else phrase1
+                        span = soup.new_tag("span", **{"class": "occurrence src-occurrence"})
+                        span.string = rep1  # this will be properly escaped
+                        src_text_tok = (
+                            [html.escape(x) for x in src_text_tok[:src_start]]
+                            + [span]
+                            + [html.escape(x) for x in src_text_tok[src_end:]]
+                        )
+
+                    if tgt_text_tok[tgt_start:tgt_end] == phrase2_tok:
+
+                        rep2 = fix2 if fix2 else phrase2
+                        span = soup.new_tag("span", **{"class": "occurrence tgt-occurrence"})
+                        span.string = rep2  # this will be properly escaped
+
+                        tgt_text_tok = (
+                            [html.escape(x) for x in tgt_text_tok[:tgt_start]]
+                            + [span]
+                            + [html.escape(x) for x in tgt_text_tok[tgt_end:]]
+                        )
+
+                    src_text = detokenise(src_text_tok)
+                    tgt_text = detokenise(tgt_text_tok)
+
+                    data.append(
+                        {
+                            "row_id": doc['row_id'],
+                            "line1": src_text,
+                            "line2": tgt_text,
+                            "score": float(doc['score']),
+                        }
+                    )
 
     return data, recordsTotal

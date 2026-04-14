@@ -183,7 +183,7 @@ export async function tokeniseLines(inputLines) {
     pthreadPoolSize: poolSize
   });
 
-  const CHUNK_SIZE = getTextTokeniseChunkSize(numCores);
+  const CHUNK_SIZE = getTextTokeniseChunkSize(poolSize);
   const totalChunks = Math.ceil(inputLines.length / CHUNK_SIZE);
 
   let resultLines = [];
