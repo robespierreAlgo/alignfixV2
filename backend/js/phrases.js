@@ -42,6 +42,15 @@ json.dumps(get_unaligned_src_counts(project_id, src_phrases))
   return JSON.parse(response || '{}');
 }
 
+function _isUnalignedVariantEntry(v) {
+  const tgt = String(v?.tgt || '').trim();
+  return (
+    Boolean(v?.is_unaligned) ||
+    tgt === UNALIGNED_SENTINEL ||
+    tgt.toLowerCase() === "unaligned"
+  );
+}
+
 async function _augmentRowsWithUnaligned(projectId, rows) {
   if (!Array.isArray(rows) || !rows.length) return rows || [];
   const singleTokenRows = rows.filter(r => _isSingleToken(r?.src_phrase || r?.src || ''));
@@ -51,28 +60,43 @@ async function _augmentRowsWithUnaligned(projectId, rows) {
 
   return rows.map((row) => {
     const srcPhrase = String(row?.src_phrase || row?.src || '').trim();
-    const unalignedCount = Number(countsBySrc[srcPhrase] || 0);
-    const alignedTotal = Number(row?.num_occurrences ?? row?.total ?? 0);
-    const total = alignedTotal + unalignedCount;
-    const alignedTopkRaw = Array.isArray(row?.topk) ? [...row.topk] : [];
-    const alignedTopk = alignedTopkRaw
-      .filter(v => String(v?.tgt || '').trim() !== UNALIGNED_SENTINEL)
+    const fetchedUnalignedCount = Number(countsBySrc[srcPhrase] || 0);
+
+    const topkRaw = Array.isArray(row?.topk) ? [...row.topk] : [];
+    const existingUnalignedTopk = topkRaw.find(v => _isUnalignedVariantEntry(v));
+    const existingUnalignedCount = Number(row?.unaligned_count ?? existingUnalignedTopk?.count ?? 0);
+
+    let alignedTopk = topkRaw
+      .filter(v => !_isUnalignedVariantEntry(v))
       .map((v) => ({
         ...v,
-        share: total ? (Number(v?.count || 0) / total) : 0,
+        count: Number(v?.count || 0),
       }))
       .sort((a, b) => Number(b?.count || 0) - Number(a?.count || 0));
+
+    let alignedTotal = alignedTopk.reduce((acc, v) => acc + Number(v?.count || 0), 0);
+    if (!alignedTotal) {
+      const currentTotal = Number(row?.num_occurrences ?? row?.total ?? 0);
+      alignedTotal = Math.max(0, currentTotal - existingUnalignedCount);
+    }
+
+    const total = alignedTotal + fetchedUnalignedCount;
+
+    alignedTopk = alignedTopk.map((v) => ({
+      ...v,
+      share: total ? (Number(v?.count || 0) / total) : 0,
+    }));
 
     const bestAligned = alignedTopk[0] || null;
     const bestAlignedCount = Number(bestAligned?.count || row?.top_count || 0);
     const bestAlignedTgt = String(bestAligned?.tgt || row?.tgt_phrase || row?.top_tgt || '').trim();
 
     const topk = [...alignedTopk];
-    if (unalignedCount > 0) {
+    if (fetchedUnalignedCount > 0) {
       topk.push({
         tgt: UNALIGNED_SENTINEL,
-        count: unalignedCount,
-        share: total ? unalignedCount / total : 0,
+        count: fetchedUnalignedCount,
+        share: total ? fetchedUnalignedCount / total : 0,
         is_unaligned: true,
       });
     }
@@ -82,13 +106,15 @@ async function _augmentRowsWithUnaligned(projectId, rows) {
       num_occurrences: total,
       total,
       top_tgt: bestAlignedTgt,
-      tgt_phrase: row?.tgt_phrase || bestAlignedTgt,
+      tgt_phrase: bestAlignedTgt || row?.tgt_phrase || '',
       top_count: bestAlignedCount,
       top_share: total ? bestAlignedCount / total : 0,
-      num_tgts: Number(row?.num_tgts || 0),
+      // Count only aligned translation variants. The unaligned bucket is shown in topk,
+      // but it is not a translation variant and must not increase the variant count.
+      num_tgts: alignedTopk.length,
       topk,
-      unaligned_count: unalignedCount,
-      unaligned_share: total ? unalignedCount / total : 0,
+      unaligned_count: fetchedUnalignedCount,
+      unaligned_share: total ? fetchedUnalignedCount / total : 0,
     };
   });
 }
@@ -2261,6 +2287,92 @@ function _getSuspicionMeta(row) {
   };
 }
 
+
+function _buildPhraseOverviewRowsFromStoredPairs(projectId, rawRows) {
+  const grouped = new Map();
+
+  for (const row of Array.isArray(rawRows) ? rawRows : []) {
+    const src_phrase = String(row?.src_phrase || row?.src || '').trim();
+    const tgt_phrase = String(row?.tgt_phrase || row?.tgt || '').trim();
+    const direction = String(row?.direction ?? "0");
+    const count = Number(row?.num_occurrences ?? row?.count ?? 0);
+
+    if (!src_phrase || !tgt_phrase || count <= 0) continue;
+
+    const key = `${direction}|||${src_phrase}`;
+    let bucket = grouped.get(key);
+    if (!bucket) {
+      bucket = {
+        src_phrase,
+        direction,
+        variants: new Map(),
+      };
+      grouped.set(key, bucket);
+    }
+
+    bucket.variants.set(
+      tgt_phrase,
+      Number(bucket.variants.get(tgt_phrase) || 0) + count
+    );
+  }
+
+  const formSet = _setFromPairs((getCachedFormAlignedCandidates(projectId)?.pairs || []).filter(p => p?.src && p?.tgt));
+  const dictionarySet = _setFromPairs((getCachedDictionaryHiddenCandidates(projectId)?.pairs || []).filter(p => p?.src && p?.tgt));
+
+  const rows = [];
+  for (const bucket of grouped.values()) {
+    const entries = [...bucket.variants.entries()]
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0) || String(a[0]).localeCompare(String(b[0])));
+
+    if (!entries.length) continue;
+
+    const total = entries.reduce((acc, [, c]) => acc + Number(c || 0), 0);
+    const [topTgt, topCount] = entries[0];
+    const topk = entries.map(([tgt, count]) => ({
+      tgt,
+      count: Number(count || 0),
+      share: total ? Number(count || 0) / total : 0,
+    }));
+
+    const key = `${bucket.src_phrase}${topTgt}`;
+    const topShare = total ? Number(topCount || 0) / total : 0;
+
+    rows.push({
+      id: `${bucket.direction}|||${bucket.src_phrase}|||${topTgt}`,
+      src_phrase: bucket.src_phrase,
+      tgt_phrase: topTgt,
+      top_tgt: topTgt,
+      direction: bucket.direction,
+      num_occurrences: total,
+      total,
+      top_share: topShare,
+      top_count: Number(topCount || 0),
+      num_tgts: entries.length,
+      entropy: _entropyFromCounts(entries.map(([, c]) => Number(c || 0))),
+      topk,
+      hidden_by_consistency:
+        _isSingleToken(bucket.src_phrase) &&
+        total >= DEFAULT_FILTER_MIN_TOTAL &&
+        topShare >= SURE_TOP_SHARE,
+      hidden_by_form: formSet.has(key),
+      hidden_by_dictionary: dictionarySet.has(key),
+    });
+  }
+
+  return rows;
+}
+
+async function _buildPhraseOverviewFallbackRows(projectId, rawRows) {
+  let rows = _buildPhraseOverviewRowsFromStoredPairs(projectId, rawRows);
+  rows = await _augmentRowsWithUnaligned(projectId, rows);
+  rows = rows.map((row) => ({
+    ...row,
+    ..._getSuspicionMeta(row),
+  }));
+  cachePhraseOverviewRows(projectId, rows);
+  return rows;
+}
+
 function _sortPhraseOverviewRows(rows, sortMode = "frequency") {
   const out = [...rows];
   if (sortMode === "worst_consistency") {
@@ -2357,10 +2469,21 @@ export async function fetchPhraseOverview(data) {
   } else {
     rows = getCachedPhraseOverviewRows(data.project_id);
     if (!rows) {
-      console.warn("Phrase overview falling back to fetchPhrases() because no cached extraction or overview is available.");
-      return fetchPhrases(data);
+      console.warn("Phrase overview rebuilding from stored phrase pairs because no cached extraction or overview is available.");
+      const fallbackRaw = await fetchPhrases({
+        ...data,
+        start: 0,
+        length: 1000000,
+      });
+      rows = await _buildPhraseOverviewFallbackRows(data.project_id, fallbackRaw?.data || []);
     }
   }
+
+  rows = await _augmentRowsWithUnaligned(data.project_id, rows);
+  rows = rows.map((row) => ({
+    ...row,
+    ..._getSuspicionMeta(row),
+  }));
 
   rows = [...rows]
     .filter((r) => directions.has(String(r.direction ?? "0")))

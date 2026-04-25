@@ -14,62 +14,48 @@
  * limitations under the License.
  */
 
-// Safe wrapper around pyodide.FS.syncfs with retries and fallback toggle
-export async function safeSyncfs(pyodide, maxAttempts = 4) {
+// Persist in-memory FS -> IndexedDB.
+// Do NOT toggle direction on failure.
+// Loading from IndexedDB belongs only in initPyodide() with syncfs(true).
+export async function safeSyncfs(pyodide, maxAttempts = 4, baseDelayMs = 200) {
     return new Promise((resolve, reject) => {
         let attempts = 0;
-        let triedToggle = false;
 
-        const trySync = (syncToPersistent = false) => {
+        const tryWrite = () => {
             try {
-                pyodide.FS.syncfs(syncToPersistent, (err) => {
+                pyodide.FS.syncfs(false, (err) => {
                     if (!err) {
                         resolve();
                         return;
                     }
 
                     const errMsg = err && err.message ? err.message : String(err);
-                    console.warn(`FS.syncfs attempt ${attempts + 1} failed:`, errMsg);
+                    console.warn(`FS.syncfs(false) attempt ${attempts + 1} failed:`, errMsg);
 
-                    // Retry with exponential backoff
                     if (attempts < maxAttempts - 1) {
                         attempts++;
-                        const delay = Math.pow(2, attempts) * 100;
-                        setTimeout(() => trySync(syncToPersistent), delay);
+                        const delay = Math.pow(2, attempts - 1) * baseDelayMs;
+                        setTimeout(tryWrite, delay);
                         return;
                     }
 
-                    // If we exhausted attempts, try toggling the sync direction once
-                    if (!triedToggle) {
-                        triedToggle = true;
-                        attempts = 0;
-                        console.warn('FS.syncfs toggling sync direction and retrying');
-                        // toggle direction: try true (syncToPersistent) if we previously used false, and vice versa
-                        trySync(!syncToPersistent);
-                        return;
-                    }
-
-                    // Give up
                     reject(err);
                 });
             } catch (ex) {
-                // catch synchronous exceptions from FS.syncfs
-                const syncErrMsg = ex && ex.message ? ex.message : String(ex);
-                console.error('FS.syncfs threw:', syncErrMsg);
+                const errMsg = ex && ex.message ? ex.message : String(ex);
+                console.error("FS.syncfs(false) threw:", errMsg);
+
                 if (attempts < maxAttempts - 1) {
                     attempts++;
-                    const delay = Math.pow(2, attempts) * 100;
-                    setTimeout(() => trySync(syncToPersistent), delay);
-                } else if (!triedToggle) {
-                    triedToggle = true;
-                    attempts = 0;
-                    trySync(!syncToPersistent);
-                } else {
-                    reject(ex);
+                    const delay = Math.pow(2, attempts - 1) * baseDelayMs;
+                    setTimeout(tryWrite, delay);
+                    return;
                 }
+
+                reject(ex);
             }
         };
 
-        trySync(false);
+        tryWrite();
     });
 }
