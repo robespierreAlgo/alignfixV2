@@ -1,6 +1,6 @@
 /*
  * Original work Copyright 2013 Chris Dyer
- * Modified work Copyright 2025 Samuel Frontull and Simon Haller-Seeber, University of Innsbruck
+ * Modified work Copyright 2025 Samuel Frontull, Simon Haller-Seeber, and Robert Sama, University of Innsbruck
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
