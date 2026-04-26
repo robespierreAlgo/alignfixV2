@@ -2260,6 +2260,7 @@ function _getSuspicionMeta(row) {
   const topk = Array.isArray(row.topk) ? row.topk : [];
   const secondShare = _getVariantShareForSuspicion(topk[1], total);
   const gap = Math.max(0, topShare - secondShare);
+  const unalignedShare = Number(row.unaligned_share || 0);
   const reasons = [];
   let score = 0;
 
@@ -2272,9 +2273,8 @@ function _getSuspicionMeta(row) {
     reasons.push('many variants');
     score += 2;
   }
-
-  if (total >= 10 && secondShare >= 0.20 && gap <= 0.15) {
-    reasons.push('top variants close');
+  if (total >= 10 && unalignedShare >= 0.20) {
+    reasons.push('high unaligned share');
     score += 2;
   }
 

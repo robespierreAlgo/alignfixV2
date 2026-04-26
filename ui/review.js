@@ -22,7 +22,7 @@ const DEFAULT_FETCH_LIMIT = 1000000;
 const DEFAULT_PAGE_SIZE = 25;
 
 const CONSISTENCY_SUSPICIOUS_MAX = 0.75;
-const CONSISTENCY_AUTO_HIDE_MIN = 0.75; // strict > threshold is used below
+const CONSISTENCY_AUTO_HIDE_MIN = 0.75; // >= threshold is used below
 const MANY_VARIANTS_THRESHOLD = 4;
 const HIGH_UNALIGNED_THRESHOLD = 0.20;
 
@@ -100,7 +100,7 @@ function isHideableByConsistency(row, minTotal = DEFAULT_MIN_TOTAL) {
   return (
     getTotalCount(row) >= minTotal &&
     hasAlignedTopVariant(row) &&
-    getConsistency(row) > CONSISTENCY_AUTO_HIDE_MIN
+    getConsistency(row) >= CONSISTENCY_AUTO_HIDE_MIN
   );
 }
 
@@ -157,7 +157,7 @@ function getConsistencyRuleStatus(row, minTotal = DEFAULT_MIN_TOTAL) {
     };
   }
 
-  if (consistency > CONSISTENCY_AUTO_HIDE_MIN) {
+  if (consistency >= CONSISTENCY_AUTO_HIDE_MIN) {
     return {
       label: "auto-hide by consistency",
       isActive: true,

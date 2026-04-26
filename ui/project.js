@@ -323,9 +323,9 @@ export async function renderProject(id) {
             <summary class="text-primary" style="cursor:pointer; user-select:none;">How “suspicious” is defined</summary>
             <div class="text-muted mt-2">
               <div>&gt; Suspicious if one of these holds:</div>
-              <div class="mt-1">• consistency &lt; 65% with 10+ occurrences</div>
+              <div class="mt-1">• consistency &lt; 75% with 10+ occurrences</div>
               <div>• 4+ aligned variants with 10+ occurrences</div>
-              <div>• two strong options with 10+ occurrences: the second shown is still frequent (20%+) and close to the best (gap 15 pts or less)</div>
+              <div>• high unaligned share >= 20% with 10+ occurrences</div>
             </div>
           </details>
           <button id="refresh-overview-btn" class="btn btn-outline-primary btn-sm mt-2">
