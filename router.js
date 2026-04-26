@@ -20,66 +20,55 @@ import { renderStats } from "./ui/stats.js";
 import { renderAbout } from "./ui/about.js";
 import { renderHistory } from "./ui/history.js";
 import { renderScores } from "./ui/scores.js";
+import { renderReview } from "./ui/review.js";
 
-const projectPages = ["project", "stats", "history", "scores"];
+const projectPages = ["project", "stats", "history", "scores", "review"];
 
 function resetContent() {
   const app = document.getElementById("app");
-  app.innerHTML = ""; // clear content
-
   const sidebar = document.getElementById("sidebar-content");
-  sidebar.innerHTML = "";
+  if (app) app.innerHTML = "";
+  if (sidebar) sidebar.innerHTML = "";
 }
 
 function setActiveNav(page) {
-
   for (const p of projectPages.concat(["home", "about"])) {
-    const pageNavItem = document.getElementById(p);
-    if (p == page) {
-      pageNavItem.classList.add("active");
-    } else {
-      pageNavItem.classList.remove("active");
-    }
+    const navItem = document.getElementById(p);
+    if (!navItem) continue;
 
-    if (page == "home" && p in projectPages) {
-      pageNavItem.style.display = "none";
+    if (p === page) navItem.classList.add("active");
+    else navItem.classList.remove("active");
+
+    if (page === "home" && projectPages.includes(p)) {
+      navItem.style.display = "none";
     }
   }
-
 }
 
-function updateNav(projectId, activePage=null) {
-
+function updateNav(projectId, activePage = null) {
   setActiveNav(null);
-  
-  for (const page of projectPages) {
-    const pageNavItem = document.getElementById(page);
-      if (pageNavItem) {
-        
-        if (activePage === page) {
-          pageNavItem.classList.add("active");
-        } else {
-          pageNavItem.classList.remove("active");
-        }
 
-        pageNavItem.style.display = "block";
-        const pageLink = pageNavItem.querySelector("a");
-        if (pageLink) {
-          pageLink.href = `#${page}-${projectId}`;
-          pageLink.textContent = `${page.charAt(0).toUpperCase() + page.slice(1)}`;
-        }
-      }
+  for (const page of projectPages) {
+    const navItem = document.getElementById(page);
+    if (!navItem) continue;
+
+    navItem.style.display = "block";
+    navItem.classList.toggle("active", activePage === page);
+
+    const pageLink = navItem.querySelector("a");
+    if (pageLink) {
+      pageLink.href = `#${page}-${projectId}`;
+      pageLink.textContent = `${page.charAt(0).toUpperCase()}${page.slice(1)}`;
+    }
   }
 }
 
 export function router() {
-  
   resetContent();
 
   const route = window.location.hash || "#home";
   const app = document.getElementById("app") || document.body;
   const sidebar = document.getElementById("sidebar-content") || null;
-
   const page = route.split("-")[0];
   const projectId = route.split("-")[1];
 
@@ -104,14 +93,17 @@ export function router() {
       updateNav(projectId, "scores");
       renderScores(projectId);
       break;
+    case "#review":
+      updateNav(projectId, "review");
+      renderReview(projectId);
+      break;
     case "#about":
       setActiveNav("about");
       renderAbout(app, sidebar);
       break;
     default:
-      app.innerHTML = "<p>404 Not Found</p>" + route;
+      app.innerHTML = `404 Not Found<br>${route}`;
   }
 }
 
-// Listen to navigation changes
 window.addEventListener("hashchange", router);
