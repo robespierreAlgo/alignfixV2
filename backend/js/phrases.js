@@ -2273,6 +2273,7 @@ function _getSuspicionMeta(row) {
     reasons.push('many variants');
     score += 2;
   }
+
   if (total >= 10 && unalignedShare >= 0.20) {
     reasons.push('high unaligned share');
     score += 2;
@@ -2284,6 +2285,7 @@ function _getSuspicionMeta(row) {
     suspicious_reasons: reasons,
     top2_share: secondShare,
     top2_gap: gap,
+    unaligned_share: unalignedShare,
   };
 }
 
