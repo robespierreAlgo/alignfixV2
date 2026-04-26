@@ -2263,7 +2263,7 @@ function _getSuspicionMeta(row) {
   const reasons = [];
   let score = 0;
 
-  if (total >= 10 && topShare < 0.65) {
+  if (total >= 10 && topShare < SURE_TOP_SHARE) {
     reasons.push('low consistency');
     score += 3;
   }

@@ -62,7 +62,7 @@ Then:
 
 A word is marked as **suspicious** if at least one of these holds:
 
-- consistency `< 65%` with `10+` occurrences
+- consistency `< 75%` with `10+` occurrences
 - `4+` aligned variants with `10+` occurrences
 - two strong options with `10+` occurrences: the second shown is still frequent (`20%+`) and close to the best (gap `15 pts` or less)
 
