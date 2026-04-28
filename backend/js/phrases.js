@@ -140,30 +140,25 @@ function getCachedExtractedPhrases(projectId) {
 
 function cachePhraseOverviewRows(projectId, rows) {
   const projectKey = String(projectId);
-  const payload = Array.isArray(rows) ? rows : [];
+  const payload = _rehydratePhraseOverviewRows(projectKey, Array.isArray(rows) ? rows : []);
+
   _LAST_PHRASE_OVERVIEW_ROWS_BY_PROJECT.set(projectKey, payload);
-  try {
-    localStorage.setItem(PHRASE_OVERVIEW_CACHE_KEY(projectKey), JSON.stringify(payload));
-  } catch (e) {
-    console.warn("⚠️ Could not persist phrase overview rows to localStorage:", e);
-  }
+
+  // Store only compact hide flags durably. Full overview rows can exceed the browser
+  // localStorage quota and are therefore kept in memory only. After reload, Review
+  // rebuilds them from the stored phrase table and compact flags.
+  _mergeHiddenFlagRows(projectKey, payload);
+  _removeLargeReviewCachesForProject(projectKey);
 }
 
 function getCachedPhraseOverviewRows(projectId) {
   const projectKey = String(projectId);
   const mem = _LAST_PHRASE_OVERVIEW_ROWS_BY_PROJECT.get(projectKey);
-  if (mem) return mem;
-  try {
-    const raw = localStorage.getItem(PHRASE_OVERVIEW_CACHE_KEY(projectKey));
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    const rows = Array.isArray(parsed) ? parsed : [];
-    _LAST_PHRASE_OVERVIEW_ROWS_BY_PROJECT.set(projectKey, rows);
-    return rows;
-  } catch (e) {
-    console.warn("⚠️ Could not restore phrase overview rows from localStorage:", e);
-    return null;
-  }
+  if (mem) return _rehydratePhraseOverviewRows(projectKey, mem);
+
+  // Deliberately do not restore full rows from localStorage. They are too large
+  // for reliable persistence. Fetch/rebuild them instead when Review loads.
+  return null;
 }
 
 // Cache form-aligned candidates from the last extraction.
@@ -172,59 +167,324 @@ const _LAST_FORM_ALIGNED_BY_PROJECT = new Map(); // projectId -> { pairs: [{src,
 const _LAST_DICTIONARY_HIDDEN_BY_PROJECT = new Map(); // projectId -> { pairs: [{src,tgt}], examples: [...], params: {...} }
 const FORM_ALIGNED_CACHE_KEY = (projectId) => `alignfix:v2:form_aligned_candidates:${projectId}`;
 const DICTIONARY_HIDDEN_CACHE_KEY = (projectId) => `alignfix:v2:dictionary_hidden_candidates:${projectId}`;
+const HIDDEN_FLAGS_CACHE_KEY = (projectId) => `alignfix:v2:hidden_flags:${projectId}`;
+
+const LARGE_REVIEW_CACHE_PREFIXES = [
+  "alignfix:v2:phrase_overview_rows:",
+  "alignfix:v2:form_aligned_candidates:",
+  "alignfix:v2:dictionary_hidden_candidates:",
+];
+
+function _removeLargeReviewCachesForProject(projectId) {
+  const suffix = String(projectId);
+
+  try {
+    for (const prefix of LARGE_REVIEW_CACHE_PREFIXES) {
+      localStorage.removeItem(`${prefix}${suffix}`);
+    }
+  } catch (e) {
+    console.warn("⚠️ Could not remove old large review caches:", e);
+  }
+}
+
+function _removeAllLargeReviewCaches() {
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (key && LARGE_REVIEW_CACHE_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+        keys.push(key);
+      }
+    }
+
+    for (const key of keys) localStorage.removeItem(key);
+  } catch (e) {
+    console.warn("⚠️ Could not remove old large review caches:", e);
+  }
+}
+
+function _isQuotaExceededError(e) {
+  return (
+    e &&
+    (e.name === "QuotaExceededError" ||
+      e.name === "NS_ERROR_DOM_QUOTA_REACHED" ||
+      e.code === 22 ||
+      e.code === 1014)
+  );
+}
 
 function cacheFormAlignedCandidates(projectId, data) {
   const projectKey = String(projectId);
   const payload = data || { pairs: [], examples: [], params: {} };
   _LAST_FORM_ALIGNED_BY_PROJECT.set(projectKey, payload);
-  try {
-    localStorage.setItem(FORM_ALIGNED_CACHE_KEY(projectKey), JSON.stringify(payload));
-  } catch (e) {
-    console.warn("⚠️ Could not persist form-aligned candidates to localStorage:", e);
-  }
+
+  // Compact flags are the durable source used by Review after browser reload.
+  _mergeHiddenFlagPairs(projectKey, "form", payload.pairs || []);
+
+  // Do not persist the full candidate list. It can be large enough to fill
+  // localStorage and then prevent the compact flags from being saved.
+  _removeLargeReviewCachesForProject(projectKey);
 }
 
 function getCachedFormAlignedCandidates(projectId) {
   const projectKey = String(projectId);
-  const mem = _LAST_FORM_ALIGNED_BY_PROJECT.get(projectKey);
-  if (mem) return mem;
-  try {
-    const raw = localStorage.getItem(FORM_ALIGNED_CACHE_KEY(projectKey));
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    _LAST_FORM_ALIGNED_BY_PROJECT.set(projectKey, parsed);
-    return parsed;
-  } catch (e) {
-    console.warn("⚠️ Could not restore form-aligned candidates from localStorage:", e);
-    return null;
-  }
+  return _LAST_FORM_ALIGNED_BY_PROJECT.get(projectKey) || null;
 }
 
 function cacheDictionaryHiddenCandidates(projectId, data) {
   const projectKey = String(projectId);
   const payload = data || { pairs: [], examples: [], params: {} };
   _LAST_DICTIONARY_HIDDEN_BY_PROJECT.set(projectKey, payload);
-  try {
-    localStorage.setItem(DICTIONARY_HIDDEN_CACHE_KEY(projectKey), JSON.stringify(payload));
-  } catch (e) {
-    console.warn("⚠️ Could not persist dictionary candidates to localStorage:", e);
-  }
+
+  // Compact flags are the durable source used by Review after browser reload.
+  _mergeHiddenFlagPairs(projectKey, "dictionary", payload.pairs || []);
+
+  // Do not persist the full candidate list. It can be large enough to fill
+  // localStorage and then prevent the compact flags from being saved.
+  _removeLargeReviewCachesForProject(projectKey);
 }
 
 function getCachedDictionaryHiddenCandidates(projectId) {
   const projectKey = String(projectId);
-  const mem = _LAST_DICTIONARY_HIDDEN_BY_PROJECT.get(projectKey);
-  if (mem) return mem;
-  try {
-    const raw = localStorage.getItem(DICTIONARY_HIDDEN_CACHE_KEY(projectKey));
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    _LAST_DICTIONARY_HIDDEN_BY_PROJECT.set(projectKey, parsed);
-    return parsed;
-  } catch (e) {
-    console.warn("⚠️ Could not restore dictionary candidates from localStorage:", e);
-    return null;
+  return _LAST_DICTIONARY_HIDDEN_BY_PROJECT.get(projectKey) || null;
+}
+
+function _hiddenPairKey(src, tgt) {
+  return `${_normTok(src)}\u001f${_normTok(tgt)}`;
+}
+
+function _compactPairsToKeys(pairs) {
+  const out = [];
+  const seen = new Set();
+
+  for (const pair of Array.isArray(pairs) ? pairs : []) {
+    const src = String(pair?.src || "").trim();
+    const tgt = String(pair?.tgt || "").trim();
+    if (!src || !tgt) continue;
+
+    const key = _hiddenPairKey(src, tgt);
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(key);
+    }
   }
+
+  return out;
+}
+
+function _loadHiddenFlags(projectId) {
+  const empty = { form: new Set(), dictionary: new Set(), checked: false };
+
+  try {
+    const raw = localStorage.getItem(HIDDEN_FLAGS_CACHE_KEY(String(projectId)));
+    if (!raw) return empty;
+
+    const parsed = JSON.parse(raw);
+    return {
+      form: new Set(Array.isArray(parsed?.form) ? parsed.form : []),
+      dictionary: new Set(Array.isArray(parsed?.dictionary) ? parsed.dictionary : []),
+      checked: Boolean(parsed?.checked),
+    };
+  } catch (e) {
+    console.warn("⚠️ Could not restore compact hidden flags from localStorage:", e);
+    return empty;
+  }
+}
+
+function _saveHiddenFlags(projectId, flags) {
+  const projectKey = String(projectId);
+  const payload = {
+    version: 4,
+    checked: Boolean(flags?.checked),
+    form: Array.from(flags?.form || []),
+    dictionary: Array.from(flags?.dictionary || []),
+  };
+
+  const serialized = JSON.stringify(payload);
+
+  // Remove old large caches first so compact flags have room.
+  _removeLargeReviewCachesForProject(projectKey);
+
+  try {
+    localStorage.setItem(HIDDEN_FLAGS_CACHE_KEY(projectKey), serialized);
+  } catch (e) {
+    if (_isQuotaExceededError(e)) {
+      _removeAllLargeReviewCaches();
+      try {
+        localStorage.setItem(HIDDEN_FLAGS_CACHE_KEY(projectKey), serialized);
+        return;
+      } catch (retryError) {
+        console.warn("⚠️ Could not persist compact hidden flags after quota cleanup:", retryError);
+        return;
+      }
+    }
+
+    console.warn("⚠️ Could not persist compact hidden flags to localStorage:", e);
+  }
+}
+
+function _mergeHiddenFlagPairs(projectId, kind, pairs) {
+  const flags = _loadHiddenFlags(projectId);
+  const targetSet = kind === "dictionary" ? flags.dictionary : flags.form;
+
+  for (const key of _compactPairsToKeys(pairs)) {
+    targetSet.add(key);
+  }
+
+  _saveHiddenFlags(projectId, flags);
+}
+
+function _markHiddenFlagsChecked(projectId) {
+  const flags = _loadHiddenFlags(projectId);
+  flags.checked = true;
+  _saveHiddenFlags(projectId, flags);
+}
+
+function _mergeHiddenFlagRows(projectId, rows) {
+  const flags = _loadHiddenFlags(projectId);
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const src = String(row?.src_phrase || row?.src || "").trim();
+    const candidates = [
+      row?.tgt_phrase,
+      row?.top_tgt,
+      row?.tgt,
+      ...(Array.isArray(row?.topk) ? row.topk.map((v) => v?.tgt) : []),
+    ];
+
+    if (!src) continue;
+
+    for (const rawTgt of candidates) {
+      const tgt = String(rawTgt || "").trim();
+      if (!tgt) continue;
+
+      const key = _hiddenPairKey(src, tgt);
+      if (row?.hidden_by_form) flags.form.add(key);
+      if (row?.hidden_by_dictionary) flags.dictionary.add(key);
+    }
+  }
+
+  _saveHiddenFlags(projectId, flags);
+}
+
+function _candidateSetFromPairs(pairs) {
+  return new Set(_compactPairsToKeys(pairs || []));
+}
+
+function _getHiddenPairSets(projectId) {
+  const flags = _loadHiddenFlags(projectId);
+
+  const formPairs = getCachedFormAlignedCandidates(projectId)?.pairs || [];
+  const dictionaryPairs = getCachedDictionaryHiddenCandidates(projectId)?.pairs || [];
+
+  return {
+    form: new Set([...flags.form, ..._candidateSetFromPairs(formPairs)]),
+    dictionary: new Set([...flags.dictionary, ..._candidateSetFromPairs(dictionaryPairs)]),
+    checked: flags.checked,
+  };
+}
+
+function _rowMatchesHiddenSet(row, hiddenSet) {
+  if (!hiddenSet || hiddenSet.size === 0) return false;
+
+  const src = String(row?.src_phrase || row?.src || "").trim();
+  if (!src) return false;
+
+  const candidates = [
+    row?.tgt_phrase,
+    row?.top_tgt,
+    row?.tgt,
+    ...(Array.isArray(row?.topk) ? row.topk.map((v) => v?.tgt) : []),
+  ];
+
+  for (const rawTgt of candidates) {
+    const tgt = String(rawTgt || "").trim();
+    if (!tgt) continue;
+    if (hiddenSet.has(_hiddenPairKey(src, tgt))) return true;
+  }
+
+  return false;
+}
+
+function _rehydratePhraseOverviewRows(projectId, rows) {
+  const payload = Array.isArray(rows) ? rows : [];
+  if (!payload.length) return payload;
+
+  const hidden = _getHiddenPairSets(projectId);
+  if (!hidden.form.size && !hidden.dictionary.size) return payload;
+
+  return payload.map((row) => ({
+    ...row,
+    hidden_by_form: Boolean(row?.hidden_by_form) || _rowMatchesHiddenSet(row, hidden.form),
+    hidden_by_dictionary: Boolean(row?.hidden_by_dictionary) || _rowMatchesHiddenSet(row, hidden.dictionary),
+  }));
+}
+
+function _hasFormDictionaryRows(rows) {
+  return Array.isArray(rows) && rows.some((row) => row?.hidden_by_form || row?.hidden_by_dictionary);
+}
+
+function _hasStoredHiddenEvidence(projectId) {
+  const hidden = _getHiddenPairSets(projectId);
+  return hidden.checked || hidden.form.size > 0 || hidden.dictionary.size > 0;
+}
+
+async function _ensureFormDictionaryCandidatesForOverview(projectId, rawRows) {
+  if (_hasStoredHiddenEvidence(projectId)) return;
+
+  const phrasesArray = (Array.isArray(rawRows) ? rawRows : [])
+    .map((row) => ({
+      src_phrase: String(row?.src_phrase || row?.src || "").trim(),
+      tgt_phrase: String(row?.tgt_phrase || row?.tgt || "").trim(),
+      direction: String(row?.direction ?? "0"),
+      num_occurrences: Number(row?.num_occurrences ?? row?.count ?? 0),
+    }))
+    .filter((row) => row.src_phrase && row.tgt_phrase);
+
+  if (!phrasesArray.length) {
+    _markHiddenFlagsChecked(projectId);
+    return;
+  }
+
+  try {
+    const morphRes = await _autoAddMorphHiddenPhrases(projectId, phrasesArray, null, {
+      allowedDirections: new Set(["0"]),
+      singleTokenOnly: true,
+      maxExamplePairs: 20,
+      doImport: false,
+    });
+
+    cacheFormAlignedCandidates(projectId, {
+      pairs: morphRes.pairs || [],
+      examples: morphRes.examples || [],
+      params: morphRes.params || {},
+    });
+
+    console.log(`ℹ️ Rebuilt form-aligned review candidates after reload: ${Number(morphRes.found || 0).toLocaleString()}`);
+  } catch (e) {
+    console.warn("⚠️ Could not rebuild form-aligned review candidates after reload:", e);
+  }
+
+  try {
+    const dictRes = await _autoAddDictionaryHiddenPhrases(projectId, phrasesArray, null, {
+      allowedDirections: new Set(["0"]),
+      singleTokenOnly: true,
+      maxExamplePairs: 20,
+      doImport: false,
+    });
+
+    cacheDictionaryHiddenCandidates(projectId, {
+      pairs: dictRes.pairs || [],
+      examples: dictRes.examples || [],
+      params: dictRes.params || {},
+    });
+
+    console.log(`ℹ️ Rebuilt dictionary review candidates after reload: ${Number(dictRes.found || 0).toLocaleString()}`);
+  } catch (e) {
+    console.warn("⚠️ Could not rebuild dictionary review candidates after reload:", e);
+  }
+
+  _markHiddenFlagsChecked(projectId);
 }
 
 // =======================
@@ -346,7 +606,7 @@ function _parseLadinTag(tagStr) {
 
 async function _loadFormarioLavbTextOnce() {
   if (!_FORMARIO_LAVB_TEXT_PROMISE) {
-    // phrases.js is /backend/js/phrases.js -> ../../local_data/... = /backend/local_data/...
+    // phrases.js is /backend/js/phrases.js -> ../../local_data/... = /local_data/...
     const url = new URL("../../local_data/formario_lavb.csv", import.meta.url);
     _FORMARIO_LAVB_TEXT_PROMISE = fetch(url).then(r => {
       if (!r.ok) throw new Error(`Cannot fetch formario_lavb.csv (${r.status})`);
@@ -2318,8 +2578,9 @@ function _buildPhraseOverviewRowsFromStoredPairs(projectId, rawRows) {
     );
   }
 
-  const formSet = _setFromPairs((getCachedFormAlignedCandidates(projectId)?.pairs || []).filter(p => p?.src && p?.tgt));
-  const dictionarySet = _setFromPairs((getCachedDictionaryHiddenCandidates(projectId)?.pairs || []).filter(p => p?.src && p?.tgt));
+  const hiddenSets = _getHiddenPairSets(projectId);
+  const formSet = hiddenSets.form;
+  const dictionarySet = hiddenSets.dictionary;
 
   const rows = [];
   for (const bucket of grouped.values()) {
@@ -2336,10 +2597,9 @@ function _buildPhraseOverviewRowsFromStoredPairs(projectId, rawRows) {
       share: total ? Number(count || 0) / total : 0,
     }));
 
-    const key = `${bucket.src_phrase}${topTgt}`;
     const topShare = total ? Number(topCount || 0) / total : 0;
 
-    rows.push({
+    const row = {
       id: `${bucket.direction}|||${bucket.src_phrase}|||${topTgt}`,
       src_phrase: bucket.src_phrase,
       tgt_phrase: topTgt,
@@ -2356,12 +2616,17 @@ function _buildPhraseOverviewRowsFromStoredPairs(projectId, rawRows) {
         _isSingleToken(bucket.src_phrase) &&
         total >= DEFAULT_FILTER_MIN_TOTAL &&
         topShare >= SURE_TOP_SHARE,
-      hidden_by_form: formSet.has(key),
-      hidden_by_dictionary: dictionarySet.has(key),
-    });
+      hidden_by_form: false,
+      hidden_by_dictionary: false,
+    };
+
+    row.hidden_by_form = _rowMatchesHiddenSet(row, formSet);
+    row.hidden_by_dictionary = _rowMatchesHiddenSet(row, dictionarySet);
+
+    rows.push(row);
   }
 
-  return rows;
+  return _rehydratePhraseOverviewRows(projectId, rows);
 }
 
 async function _buildPhraseOverviewFallbackRows(projectId, rawRows) {
@@ -2371,6 +2636,7 @@ async function _buildPhraseOverviewFallbackRows(projectId, rawRows) {
     ...row,
     ..._getSuspicionMeta(row),
   }));
+  rows = _rehydratePhraseOverviewRows(projectId, rows);
   cachePhraseOverviewRows(projectId, rows);
   return rows;
 }
@@ -2418,14 +2684,16 @@ async function _buildPhraseOverviewRowsFromExtracted(projectId, phrases) {
   });
 
   const consistencySet = _setFromPairs(consistency.pairs || []);
-  const formSet = _setFromPairs((getCachedFormAlignedCandidates(projectId)?.pairs || []).filter(p => p?.src && p?.tgt));
-  const dictionarySet = _setFromPairs((getCachedDictionaryHiddenCandidates(projectId)?.pairs || []).filter(p => p?.src && p?.tgt));
+  const hiddenSets = _getHiddenPairSets(projectId);
+  const formSet = hiddenSets.form;
+  const dictionarySet = hiddenSets.dictionary;
 
   let rows = (base.rows || []).map((r) => {
     const src_phrase = (r.src || "").trim();
     const tgt_phrase = (r.top_tgt || "").trim();
-    const key = `${src_phrase}${tgt_phrase}`;
-    return {
+    const consistencyKey = `${src_phrase}${tgt_phrase}`;
+
+    const row = {
       id: `${String(r.direction ?? "0")}|||${src_phrase}|||${tgt_phrase}`,
       src_phrase,
       tgt_phrase,
@@ -2436,10 +2704,15 @@ async function _buildPhraseOverviewRowsFromExtracted(projectId, phrases) {
       num_tgts: Number(r.num_tgts || 0),
       entropy: Number(r.entropy || 0),
       topk: r.topk || [],
-      hidden_by_consistency: consistencySet.has(key),
-      hidden_by_form: formSet.has(key),
-      hidden_by_dictionary: dictionarySet.has(key),
+      hidden_by_consistency: consistencySet.has(consistencyKey),
+      hidden_by_form: false,
+      hidden_by_dictionary: false,
     };
+
+    row.hidden_by_form = _rowMatchesHiddenSet(row, formSet);
+    row.hidden_by_dictionary = _rowMatchesHiddenSet(row, dictionarySet);
+
+    return row;
   });
 
   rows = await _augmentRowsWithUnaligned(projectId, rows);
@@ -2448,11 +2721,14 @@ async function _buildPhraseOverviewRowsFromExtracted(projectId, phrases) {
     ..._getSuspicionMeta(row),
   }));
 
+  rows = _rehydratePhraseOverviewRows(projectId, rows);
   cachePhraseOverviewRows(projectId, rows);
   return rows;
 }
 
 export async function fetchPhraseOverview(data) {
+  _removeLargeReviewCachesForProject(data.project_id);
+
   const phrases = getCachedExtractedPhrases(data.project_id);
 
   const directions = _normalizeDirectionsForOverview(data.directions);
@@ -2470,18 +2746,25 @@ export async function fetchPhraseOverview(data) {
     rows = await _buildPhraseOverviewRowsFromExtracted(data.project_id, phrases);
   } else {
     rows = getCachedPhraseOverviewRows(data.project_id);
-    if (!rows) {
-      console.warn("Phrase overview rebuilding from stored phrase pairs because no cached extraction or overview is available.");
+
+    const cachedRowsMissingFormDictionary =
+      rows && !_hasFormDictionaryRows(rows) && !_hasStoredHiddenEvidence(data.project_id);
+
+    if (!rows || cachedRowsMissingFormDictionary) {
+      console.warn("Phrase overview rebuilding from stored phrase pairs to restore durable hide reasons.");
       const fallbackRaw = await fetchPhrases({
         ...data,
         start: 0,
         length: 1000000,
       });
+
+      await _ensureFormDictionaryCandidatesForOverview(data.project_id, fallbackRaw?.data || []);
       rows = await _buildPhraseOverviewFallbackRows(data.project_id, fallbackRaw?.data || []);
     }
   }
 
   rows = await _augmentRowsWithUnaligned(data.project_id, rows);
+  rows = _rehydratePhraseOverviewRows(data.project_id, rows);
   rows = rows.map((row) => ({
     ...row,
     ..._getSuspicionMeta(row),
